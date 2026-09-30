@@ -45,6 +45,7 @@ pub struct MDrive {
     pub name: String,
     pub quota: Option<u64>,
     pub cover: Option<Vec<u8>>,
+    pub color: Option<String>,
     pub folders: HashMap<String, MFolder>,
     pub files: HashMap<String, MFile>,
     pub version: u64,
@@ -158,12 +159,14 @@ pub struct MockState {
     pub fail_all: bool,
     /// Omit ids from write responses (to exercise the client's fallback).
     pub terse: bool,
+    /// Per-server id prefix, so parallel servers never share ids.
+    pub tag: String,
 }
 
 impl MockState {
     fn next_id(&mut self, prefix: &str) -> String {
         self.seq += 1;
-        format!("{prefix}_{:06}", self.seq)
+        format!("{prefix}_{}{:06}", self.tag, self.seq)
     }
     pub fn drive(&self, sid: &str) -> Option<&MDrive> {
         self.drives.iter().find(|d| d.storage_id == sid)
@@ -236,6 +239,12 @@ impl MockServer {
         let state: Shared = Arc::new(Mutex::new(MockState {
             token: "test-token".into(),
             orgs: vec![("org_1".into(), "Test Org".into())],
+            tag: {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+                format!("{:x}{n}", (t ^ (std::process::id() as u64) << 20) & 0xffffff)
+            },
             ..Default::default()
         }));
         Self::start_with(port, state)
@@ -299,6 +308,7 @@ impl MockServer {
             name: name.into(),
             quota,
             cover: None,
+            color: None,
             folders: HashMap::new(),
             files: HashMap::new(),
             version: 1,
@@ -521,7 +531,7 @@ async fn handler(
                 .map(|d| {
                     json!({
                         "storageId": d.storage_id, "name": d.name, "sizeBytes": d.used(),
-                        "quotaBytes": d.quota, "hasCover": d.cover.is_some(), "updatedAt": now_iso()
+                        "quotaBytes": d.quota, "hasCover": d.cover.is_some(), "color": d.color, "updatedAt": now_iso()
                     })
                 })
                 .collect();
@@ -530,7 +540,14 @@ async fn handler(
         ("GET", "cover") => {
             let i = drive!(q.get("storageId").cloned().unwrap_or_default());
             match &s.drives[i].cover {
-                Some(c) => ([("content-type", "image/png")], c.clone()).into_response(),
+                Some(c) => {
+                    let etag = format!("\"c{}\"", &hex(&Sha256::digest(c))[..16]);
+                    let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok());
+                    if inm == Some(etag.as_str()) {
+                        return (StatusCode::NOT_MODIFIED, [("etag", etag)]).into_response();
+                    }
+                    ([("content-type", "image/png".to_string()), ("etag", etag)], c.clone()).into_response()
+                }
                 None => error(StatusCode::NOT_FOUND, "not_found", "no cover"),
             }
         }
@@ -851,9 +868,18 @@ fn mock_admin(
                 None => error(StatusCode::NOT_FOUND, "not_found", "file"),
             }
         }
+        // Set the cover (body = image bytes); an empty body clears it.
         ("POST", "cover") => {
             if let Some(d) = s.drive_mut(&sid) {
-                d.cover = Some(body.to_vec());
+                d.cover = (!body.is_empty()).then(|| body.to_vec());
+            }
+            axum::Json(json!({ "ok": true })).into_response()
+        }
+        // ?color=%2338bdf8 sets the accent colour; no param clears it.
+        ("POST", "color") => {
+            let c = q.get("color").cloned();
+            if let Some(d) = s.drive_mut(&sid) {
+                d.color = c;
             }
             axum::Json(json!({ "ok": true })).into_response()
         }

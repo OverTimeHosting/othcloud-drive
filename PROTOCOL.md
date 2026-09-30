@@ -48,7 +48,7 @@ HTTP status: 400 bad input, 401 bad/missing token, 403 not allowed, 404 not foun
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `orgs` | `[{ id, name }]` orgs the user belongs to |
-| GET | `drives` | `[{ storageId, name, sizeBytes, quotaBytes, hasCover, updatedAt }]` |
+| GET | `drives` | `[{ storageId, name, sizeBytes, quotaBytes, hasCover, color, updatedAt }]` — `color` is the drive accent ("#38bdf8") or null |
 | GET | `cover?storageId=` | the drive's cover image bytes (`Content-Type` image/*); 404 if none |
 | GET | `tree?storageId=` | the WHOLE drive, flat (see below). Honors `If-None-Match` → 304 |
 | GET/HEAD | `file?fileId=` | file bytes. Honors `Range` (single `bytes=a-b` / `a-` / `-n`) → 206 + `Content-Range`; past the end → 416. Sends `ETag` (changes with the contents) and honors `If-None-Match` → 304 |
@@ -121,17 +121,52 @@ paths onto ids from this tree.
 file or folder only rewrites rows, so moving a 10 GB folder is instant and a
 file's `fileId` never changes.
 
-## Windows app behaviour (v1)
+## Windows app behaviour (v1, Cloud Files API)
 
-- Each OTHCloud drive the user picks is mounted as its OWN drive letter
-  (WinFsp), starting at `O:` and skipping taken letters. Volume label = drive
-  name. The drive's cover image becomes that letter's Explorer icon
-  (converted to .ico, registered per-user under
-  `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>\DefaultIcon`).
-- Two-way: reads fetch on demand (ranges) into a local cache
-  (`%LOCALAPPDATA%\OTHCloud Drive\cache`); writes land in the cache and are
-  uploaded on close/flush; create/rename/move/delete call the API immediately.
+The app is a Windows **cloud files provider** (the Cloud Files API /
+`cldapi`, the same platform OneDrive uses). No kernel driver or third-party
+filesystem is involved.
+
+- **One sync root per drive**: a normal NTFS folder,
+  `%USERPROFILE%\OTHCloud\<drive name>`, registered with the shell
+  (`StorageProviderSyncRootManager`, id `OTHCloudDrive!<user SID>!<storageId>`,
+  display name = drive name). Hydration policy *Progressive*, population
+  policy *AlwaysFull*: the whole `tree` is turned into placeholders up front
+  (the protocol only offers the whole tree anyway), so listing and search
+  work offline and nothing is fetched to show a folder.
+- **Also a drive letter per drive**: each sync root is aliased as its own
+  letter from `O:` upward (skipping taken letters) with `subst` semantics
+  (`DefineDosDeviceW`, per user session; re-created at every start, removed
+  on quit). Explorer label/icon for the letter:
+  `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>\DefaultLabel`
+  / `DefaultIcon`.
+- **Drive icon** (letter + sync-root sidebar entry, the same .ico): the
+  cover (`GET cover`, revalidated with `If-None-Match` at most once a minute)
+  in a rounded tile with an OTHCloud badge; without a cover, a tile in the
+  drive's `color` (from `GET drives`; fallback brand navy) with the OTH logo.
+  A cover or colour change writes a NEW .ico file name (Explorer caches icons
+  by path), repoints both icons and deletes the old file.
+- **Remote → local**: `tree` is polled every ~15 s with `If-None-Match`; the
+  diff becomes placeholder create / update+dehydrate (content changed) /
+  rename / delete (only files that are in sync; local unsynced edits win and
+  are uploaded).
+- **Reads**: a placeholder is hydrated on first access by ranged `GET file`
+  calls (≤ 4 MiB each, exactly the byte ranges Windows requests). The
+  placeholder itself is the cache; *Free up space* / *Always keep on this
+  device* (`attrib +U` / `+P`) dehydrate / hydrate it.
+- **Local → remote**: renames/moves and deletes of placeholders arrive as
+  platform callbacks and become `POST move` / `DELETE item` (deletes after a
+  few seconds' grace, so a save-by-replace can reuse the id). New and
+  modified files/folders are found by a directory watcher (+ a rescan) and
+  uploaded (`PUT file`, create or replace, always with `Content-Length`),
+  then marked in sync. Scratch files (`~$*`, `*.tmp`, …) never leave the PC;
+  Office's "rename original away, rename new file into place" and editors'
+  `MoveFileEx(REPLACE_EXISTING)` keep the server `fileId`.
+- **Sign out** unregisters every sync root and deletes the placeholders;
+  anything not uploaded is first copied to
+  `%USERPROFILE%\OTHCloud\Not uploaded - <drive> - <time>`.
 - Photo backup: optional — watch a chosen local folder (default the user's
   Pictures) and upload new images into a chosen drive/folder
   (default `<drive>/Photo backup/<PC name>`), never deleting anything remotely.
-- Tray icon: status, pause sync, open drive, settings, sign out.
+- Tray icon: status, per-drive sync toggle + open, pause sync, photo backup,
+  organization, sign in/out, quit.

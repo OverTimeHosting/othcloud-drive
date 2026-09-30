@@ -1,23 +1,20 @@
-//! The same flows as tests/drive.rs, against a REAL panel. Opt-in:
+//! The engine flows against a REAL panel, through a real sync root. Opt-in:
 //!
-//!   OTHCLOUD_REAL_PANEL=http://127.0.0.1:3900 OTHCLOUD_REAL_TOKEN=… \
-//!   OTHCLOUD_REAL_ORG=… OTHCLOUD_REAL_STORAGE=… cargo test --test real_panel
+//!   OTHCLOUD_REAL_PANEL=http://127.0.0.1:3900 [OTHCLOUD_REAL_TOKEN=…]
+//!   [OTHCLOUD_REAL_ORG=…] [OTHCLOUD_REAL_STORAGE=…] cargo test --test real_panel
 //!
-//! Without OTHCLOUD_REAL_PANEL every test returns immediately. Everything is
-//! done inside a fresh top-level folder that is deleted at the end.
+//! Without OTHCLOUD_REAL_PANEL every test returns immediately. Everything
+//! is done inside a fresh top-level folder that is deleted at the end.
 
-use othcloud_drive::api::{Api, ItemType};
-use othcloud_drive::drive::{status, DriveCore, DriveOptions};
+use othcloud_drive::api::{Api, ItemType, Tree};
+use othcloud_drive::cf;
+use othcloud_drive::engine::{remove_root, Engine, EngineOptions};
+use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-struct Env {
-    api: Api,
-    sid: String,
-}
-
-fn env() -> Option<Env> {
+fn env() -> Option<(Api, String)> {
     let origin = std::env::var("OTHCLOUD_REAL_PANEL").ok()?;
     let token = std::env::var("OTHCLOUD_REAL_TOKEN").unwrap_or_else(|_| "drive-test-alice".into());
     let org = std::env::var("OTHCLOUD_REAL_ORG").unwrap_or_else(|_| "org_test_acme".into());
@@ -26,228 +23,191 @@ fn env() -> Option<Env> {
         .with_test_writer()
         .with_env_filter("othcloud_drive=info")
         .try_init();
-    Some(Env {
-        api: Api::new(&origin, &token, Some(org)),
-        sid,
-    })
+    Some((Api::new(&origin, &token, Some(org)), sid))
 }
 
-fn core(e: &Env, dir: &std::path::Path) -> Arc<DriveCore> {
-    let c = DriveCore::new(
-        e.api.clone(),
-        &e.sid,
-        "Real",
-        dir.join(&e.sid),
-        Arc::new(AtomicBool::new(false)),
-        DriveOptions {
-            poll_interval: Duration::from_secs(3600),
-            upload_delay: Duration::from_millis(200),
-            host_name: "TESTPC".into(),
-        },
-    )
-    .unwrap();
-    c.refresh().unwrap();
-    c.start_workers();
-    c
+fn cmd(args: &[&str]) {
+    // Another process, so the platform sends rename/delete notifications.
+    let out = std::process::Command::new("cmd").args(["/d", "/c"]).args(args).output().unwrap();
+    assert!(out.status.success(), "cmd {args:?}: {}", String::from_utf8_lossy(&out.stdout));
+}
+fn s(p: &Path) -> String {
+    p.display().to_string()
+}
+
+/// Unregisters on drop, so a failing assertion can't leak a sync root.
+struct RootGuard(Vec<String>);
+impl Drop for RootGuard {
+    fn drop(&mut self) {
+        for id in &self.0 {
+            let _ = cf::unregister_sync_root(id);
+        }
+    }
 }
 
 fn pattern(n: usize, seed: u32) -> Vec<u8> {
-    (0..n as u32)
-        .map(|i| (i.wrapping_add(seed).wrapping_mul(2654435761) >> 11) as u8)
-        .collect()
+    (0..n as u32).map(|i| (i.wrapping_add(seed).wrapping_mul(2654435761) >> 11) as u8).collect()
 }
 
-fn read_all(core: &DriveCore, path: &str) -> Vec<u8> {
-    let info = core.open(path).unwrap();
-    let mut out = vec![0u8; info.size as usize];
-    let mut off = 0;
-    while off < out.len() {
-        let end = (off + (1 << 20)).min(out.len());
-        let n = core.read(info.id, &mut out[off..end], off as u64).unwrap();
-        assert!(n > 0);
-        off += n;
-    }
-    core.close(info.id);
-    out
+fn tree(api: &Api, sid: &str) -> Tree {
+    api.tree(sid, None).unwrap().unwrap()
 }
 
-fn write_file(core: &DriveCore, path: &str, data: &[u8]) {
-    let info = match core.create(path, false) {
-        Ok(i) => i,
-        Err(e) if e.0 == status::OBJECT_NAME_COLLISION => {
-            let i = core.open(path).unwrap();
-            core.overwrite(i.id).unwrap();
-            i
-        }
-        Err(e) => panic!("create {path}: {e}"),
-    };
-    for (i, chunk) in data.chunks(1 << 20).enumerate() {
-        core.write(info.id, chunk, (i << 20) as u64, false, false).unwrap();
-    }
-    core.flush(info.id);
-    core.close(info.id);
-}
-
-/// Server file by path under the test root, via a fresh tree.
-fn server_file(e: &Env, path: &[&str]) -> Option<(String, u64)> {
-    let t = e.api.tree(&e.sid, None).unwrap().unwrap();
+/// Server file (id, size) at path components under the drive root.
+fn server_file(api: &Api, sid: &str, path: &[&str]) -> Option<(String, u64)> {
+    let t = tree(api, sid);
     let mut parent: Option<String> = None;
     for dir in &path[..path.len() - 1] {
-        parent = Some(
-            t.folders
-                .iter()
-                .find(|f| f.parent_id == parent && f.name == *dir)?
-                .folder_id
-                .clone(),
-        );
+        parent = Some(t.folders.iter().find(|f| f.parent_id == parent && f.name == *dir)?.folder_id.clone());
     }
-    let name = path[path.len() - 1];
     t.files
         .iter()
-        .find(|f| f.folder_id == parent && f.name == name)
+        .find(|f| f.folder_id == parent && f.name == path[path.len() - 1])
         .map(|f| (f.file_id.clone(), f.size_bytes))
 }
 
-fn server_bytes(e: &Env, id: &str) -> Vec<u8> {
+fn server_bytes(api: &Api, id: &str) -> Vec<u8> {
     let mut v = Vec::new();
-    e.api.download(id, &mut v).unwrap();
+    api.download(id, &mut v).unwrap();
     v
+}
+
+fn wait(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    f()
 }
 
 #[test]
 fn real_panel_end_to_end() {
-    let Some(e) = env() else {
+    let Some((api, sid)) = env() else {
         eprintln!("OTHCLOUD_REAL_PANEL not set; skipping");
         return;
     };
-    let root = format!("drive-client-test-{}", std::process::id());
-    let dir = tempfile::tempdir().unwrap();
-    let c = core(&e, dir.path());
-    let r = format!("\\{root}");
+    let top = format!("drive-client-test-{}", std::process::id());
+    let base = tempfile::tempdir().unwrap();
+    let e = Engine::start(
+        api.clone(),
+        &sid,
+        "Real",
+        &base.path().join("Real"),
+        "%SystemRoot%\\System32\\imageres.dll,-1043",
+        Arc::new(AtomicBool::new(false)),
+        EngineOptions {
+            poll_interval: Duration::from_secs(3600),
+            settle: Duration::from_millis(300),
+            delete_grace: Duration::from_millis(800),
+            host_name: "TESTPC".into(),
+            rescan_interval: Duration::from_secs(3600),
+            provider: cf::TEST_PROVIDER.into(),
+            cover_interval: Duration::from_secs(3600),
+        },
+    )
+    .unwrap();
+    let _guard = RootGuard(vec![e.sync_root_id.clone()]);
+    let r = e.root.join(&top);
+    let idle = || {
+        std::thread::sleep(Duration::from_millis(800));
+        assert!(e.wait_idle(Duration::from_secs(60)));
+    };
 
-    // mkdir
-    let d = c.create(&r, true).unwrap();
-    c.close(d.id);
-    let sub = c.create(&format!("{r}\\Sub"), true).unwrap();
-    c.close(sub.id);
-
-    // multi-MB upload, then read back through a FRESH core (ranged GETs)
+    std::fs::create_dir_all(r.join("Sub")).unwrap();
     let big = pattern(3 * 1024 * 1024 + 777, 9);
-    write_file(&c, &format!("{r}\\Sub\\big.bin"), &big);
-    assert!(c.wait_idle(Duration::from_secs(60)), "upload didn't finish");
-    let (bid, bsize) = server_file(&e, &[&root, "Sub", "big.bin"]).expect("big.bin on server");
+    std::fs::write(r.join("Sub\\big.bin"), &big).unwrap();
+    idle();
+    let (bid, bsize) = server_file(&api, &sid, &[&top, "Sub", "big.bin"]).expect("uploaded");
     assert_eq!(bsize, big.len() as u64);
-    assert_eq!(server_bytes(&e, &bid), big);
-    let dir2 = tempfile::tempdir().unwrap();
-    let c2 = core(&e, dir2.path());
-    let info = c2.open(&format!("{r}\\SUB\\BIG.BIN")).unwrap();
-    let mut buf = vec![0u8; 5000];
-    c2.read(info.id, &mut buf, 2_000_000).unwrap();
-    assert_eq!(&buf[..], &big[2_000_000..2_005_000]);
-    c2.close(info.id);
-    assert_eq!(read_all(&c2, &format!("{r}\\Sub\\big.bin")), big);
-    c2.stop();
+    assert_eq!(server_bytes(&api, &bid), big);
+    assert!(cf::placeholder_info(&r.join("Sub\\big.bin")).unwrap().unwrap().in_sync);
 
-    // rename + move
-    let b = c.open(&format!("{r}\\Sub\\big.bin")).unwrap();
-    c.rename(b.id, &format!("{r}\\big2.bin"), false).unwrap();
-    c.close(b.id);
-    assert_eq!(server_file(&e, &[&root, "big2.bin"]).unwrap().0, bid, "move keeps id");
-    // case-only rename
-    let b = c.open(&format!("{r}\\big2.bin")).unwrap();
-    c.rename(b.id, &format!("{r}\\BIG2.bin"), false).unwrap();
-    c.close(b.id);
-    assert!(server_file(&e, &[&root, "BIG2.bin"]).is_some());
+    // Rename + move keep the id and don't re-upload.
+    cmd(&["move", &s(&r.join("Sub\\big.bin")), &s(&r.join("big2.bin"))]);
+    idle();
+    assert_eq!(server_file(&api, &sid, &[&top, "big2.bin"]).unwrap().0, bid);
 
-    // editor pattern: write sibling, rename over with replace -> same id
-    write_file(&c, &format!("{r}\\notes.txt"), b"v1");
-    assert!(c.wait_idle(Duration::from_secs(30)));
-    let (nid, _) = server_file(&e, &[&root, "notes.txt"]).unwrap();
-    write_file(&c, &format!("{r}\\notes.txt.new"), b"version two");
-    let n = c.open(&format!("{r}\\notes.txt.new")).unwrap();
-    c.rename(n.id, &format!("{r}\\notes.txt"), true).unwrap();
-    c.close(n.id);
-    assert!(c.wait_idle(Duration::from_secs(30)));
-    let (nid2, _) = server_file(&e, &[&root, "notes.txt"]).unwrap();
-    assert_eq!(nid2, nid);
-    assert_eq!(server_bytes(&e, &nid), b"version two");
-    assert!(server_file(&e, &[&root, "notes.txt.new"]).is_none());
+    // Editor save (MoveFileEx replace) keeps the id.
+    std::fs::write(r.join("notes.txt"), b"v1").unwrap();
+    idle();
+    let (nid, _) = server_file(&api, &sid, &[&top, "notes.txt"]).unwrap();
+    std::fs::write(r.join("notes.txt.new"), b"version two").unwrap();
+    cmd(&["move", "/y", &s(&r.join("notes.txt.new")), &s(&r.join("notes.txt"))]);
+    std::thread::sleep(Duration::from_millis(1500));
+    idle();
+    assert_eq!(server_file(&api, &sid, &[&top, "notes.txt"]).unwrap().0, nid);
+    assert_eq!(server_bytes(&api, &nid), b"version two");
 
-    // Word save dance
-    write_file(&c, &format!("{r}\\Report.docx"), b"doc v1");
-    assert!(c.wait_idle(Duration::from_secs(30)));
-    let (did, _) = server_file(&e, &[&root, "Report.docx"]).unwrap();
-    write_file(&c, &format!("{r}\\~$Report.docx"), b"lock");
-    write_file(&c, &format!("{r}\\~WRD0000.tmp"), b"doc v2 longer");
-    let o = c.open(&format!("{r}\\Report.docx")).unwrap();
-    c.rename(o.id, &format!("{r}\\~WRL0001.tmp"), false).unwrap();
-    c.close(o.id);
-    let t = c.open(&format!("{r}\\~WRD0000.tmp")).unwrap();
-    c.rename(t.id, &format!("{r}\\Report.docx"), false).unwrap();
-    c.close(t.id);
-    for p in ["~WRL0001.tmp", "~$Report.docx"] {
-        let x = c.open(&format!("{r}\\{p}")).unwrap();
-        c.delete(x.id).unwrap();
-        c.close(x.id);
-    }
-    assert!(c.wait_idle(Duration::from_secs(30)));
-    assert_eq!(server_file(&e, &[&root, "Report.docx"]).unwrap().0, did);
-    assert_eq!(server_bytes(&e, &did), b"doc v2 longer");
+    // Word dance keeps the id; no temp file on the server.
+    std::fs::write(r.join("Report.docx"), b"doc v1").unwrap();
+    idle();
+    let (did, _) = server_file(&api, &sid, &[&top, "Report.docx"]).unwrap();
+    std::fs::write(r.join("~WRD0000.tmp"), b"doc v2 longer").unwrap();
+    cmd(&["move", &s(&r.join("Report.docx")), &s(&r.join("~WRL0001.tmp"))]);
+    cmd(&["move", &s(&r.join("~WRD0000.tmp")), &s(&r.join("Report.docx"))]);
+    cmd(&["del", "/q", &s(&r.join("~WRL0001.tmp"))]);
+    std::thread::sleep(Duration::from_millis(1500));
+    idle();
+    assert_eq!(server_file(&api, &sid, &[&top, "Report.docx"]).unwrap().0, did);
+    assert_eq!(server_bytes(&api, &did), b"doc v2 longer");
+    let t = tree(&api, &sid);
+    assert!(!t.files.iter().any(|f| f.name.ends_with(".tmp")), "temp leaked");
 
-    // name collision with a folder (server: unique across kinds)
-    let f = c.create(&format!("{r}\\Clash"), true).unwrap();
-    c.close(f.id);
-    assert_eq!(
-        c.create(&format!("{r}\\clash"), false).unwrap_err().0,
-        status::OBJECT_NAME_COLLISION
-    );
-
-    // server-side change shows up after a poll (ETag honoured)
-    // Our own changes must not come back as remote changes (other agents
-    // may be using the same drive, so only look inside our folder).
-    c.refresh().unwrap();
-    let ours: Vec<_> = c
-        .take_changes()
-        .into_iter()
-        .filter(|ch| format!("{ch:?}").contains(&root))
-        .collect();
-    assert!(ours.is_empty(), "own changes echoed back: {ours:?}");
-    assert!(!c.refresh().unwrap(), "second poll should be a 304");
-    let (rid, _) = server_file(&e, &[&root, "Report.docx"]).unwrap();
-    let tmp = dir.path().join("remote.bin");
+    // Server-side change: dehydrated, re-read gives the new bytes.
+    let tmp = base.path().join("srv.txt");
     std::fs::write(&tmp, b"changed on the server").unwrap();
-    e.api.upload_replace(&rid, &tmp).unwrap();
-    assert!(c.refresh().unwrap());
-    assert_eq!(read_all(&c, &format!("{r}\\Report.docx")), b"changed on the server");
+    api.upload_replace(&did, &tmp).unwrap();
+    assert!(e.refresh().unwrap());
+    let rp = r.join("Report.docx");
+    assert!(cf::attributes(&rp).unwrap() & cf::ATTR_RECALL_ON_DATA_ACCESS != 0);
+    assert_eq!(std::fs::read(&rp).unwrap(), b"changed on the server");
+    assert!(!e.refresh().unwrap(), "no echo of our own state");
 
-    // delete a file, then the whole test folder (recursive on the server)
-    let x = c.open(&format!("{r}\\BIG2.bin")).unwrap();
-    c.delete(x.id).unwrap();
-    c.close(x.id);
-    assert!(server_file(&e, &[&root, "BIG2.bin"]).is_none());
-    let t = e.api.tree(&e.sid, None).unwrap().unwrap();
-    let rootf = t.folders.iter().find(|f| f.name == root && f.parent_id.is_none()).unwrap();
-    e.api.delete_item(ItemType::Folder, &rootf.folder_id).unwrap();
-    c.refresh().unwrap();
-    assert!(c.lookup(&r).is_err());
-    c.stop();
+    // Fresh sync root elsewhere: the big file is a dehydrated placeholder
+    // that hydrates via ranged GETs.
+    let base2 = tempfile::tempdir().unwrap();
+    let e2 = Engine::start(
+        api.clone(),
+        &sid,
+        "Real2",
+        &base2.path().join("Real"),
+        "%SystemRoot%\\System32\\imageres.dll,-1043",
+        Arc::new(AtomicBool::new(false)),
+        EngineOptions { provider: cf::TEST_PROVIDER.into(), ..Default::default() },
+    );
+    // Same storage => same sync root id; registering a second path for it
+    // re-points the id. Only do the check if it worked.
+    if let Ok(e2) = e2 {
+        let p2 = e2.root.join(&top).join("big2.bin");
+        assert!(cf::attributes(&p2).unwrap() & cf::ATTR_RECALL_ON_DATA_ACCESS != 0);
+        assert_eq!(std::fs::read(&p2).unwrap(), big);
+        e2.shutdown(Duration::from_secs(5));
+        let _ = remove_root(&e2.sync_root_id, &e2.root, "Real2", base2.path());
+    }
+
+    // Delete the test folder from the drive (recursive on the server).
+    cmd(&["rmdir", "/s", "/q", &s(&r)]);
+    assert!(wait(30, || !tree(&api, &sid).folders.iter().any(|f| f.name == top)), "folder not deleted");
+    e.shutdown(Duration::from_secs(10));
+    let _ = remove_root(&e.sync_root_id, &e.root, "Real", base.path());
+    let t = tree(&api, &sid);
+    if let Some(f) = t.folders.iter().find(|f| f.name == top) {
+        let _ = api.delete_item(ItemType::Folder, &f.folder_id);
+    }
 }
 
 #[test]
 fn real_panel_quota_and_errors() {
-    let Some(e) = env() else { return };
-    // 1000-byte quota drive from the seed (900 used).
-    let small = Api::new(
-        e.api.origin(),
-        &std::env::var("OTHCLOUD_REAL_TOKEN").unwrap_or_else(|_| "drive-test-alice".into()),
-        e.api.org().map(String::from),
-    );
-    let err = small
+    let Some((api, sid)) = env() else { return };
+    let err = api
         .upload_new_bytes("stor_test_small", None, "too-big.bin", vec![0u8; 5000])
         .unwrap_err();
     assert!(err.is_quota(), "{err}");
-    let bad = Api::new(e.api.origin(), "not-a-token", e.api.org().map(String::from));
+    let bad = Api::new(api.origin(), "not-a-token", api.org().map(String::from));
     assert!(bad.drives().unwrap_err().is_auth());
-    let t = e.api.tree(&e.sid, None).unwrap().unwrap();
-    assert!(e.api.tree(&e.sid, Some(&t.etag)).unwrap().is_none(), "304 expected");
+    let t = api.tree(&sid, None).unwrap().unwrap();
+    assert!(api.tree(&sid, Some(&t.etag)).unwrap().is_none(), "304 expected");
 }

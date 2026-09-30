@@ -1,17 +1,23 @@
-//! The app's state and actions (sign in/out, org, mount/unmount, pause,
-//! photo backup), shared by the tray UI and the headless `mount` command.
+//! The app's state and actions (sign in/out, org, sync/unsync drives,
+//! pause, photo backup), shared by the tray UI and the headless `mount`.
 
 use crate::api::{Api, DriveInfo, Org};
 use crate::backup::{BackupHandle, BackupJob};
 use crate::config::{self, Config, Credentials};
-use crate::drive::{DriveCore, DriveOptions};
-use crate::fs::Mounted;
-use crate::platform;
+use crate::engine::{Engine, EngineOptions};
+use crate::{letters, platform};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// One synced drive: its engine, folder and (optional) drive letter.
+pub struct Mounted {
+    pub engine: Arc<Engine>,
+    pub root: PathBuf,
+    pub letter: Option<char>,
+}
 
 pub struct App {
     pub cfg: Config,
@@ -24,12 +30,119 @@ pub struct App {
     pub mounts: HashMap<String, Mounted>,
     pub paused: Arc<AtomicBool>,
     pub backup: Option<BackupHandle>,
-    pub winfsp: Result<(), String>,
     pub last_error: Option<String>,
 }
 
-pub fn drive_label(d: &DriveInfo) -> String {
-    crate::fs::volume_label(&d.name)
+/// `%USERPROFILE%\OTHCloud` (override: OTHCLOUD_DRIVE_ROOT_BASE).
+pub fn roots_base() -> PathBuf {
+    if let Ok(b) = std::env::var("OTHCLOUD_DRIVE_ROOT_BASE") {
+        return PathBuf::from(b);
+    }
+    std::env::var("USERPROFILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("C:\\"))
+        .join("OTHCloud")
+}
+
+/// A folder name for a drive: Windows-safe, no trailing dots/spaces.
+pub fn folder_name(drive_name: &str) -> String {
+    if drive_name.trim().is_empty() {
+        return "Drive".into();
+    }
+    let mut s = crate::util::display_name(drive_name.trim());
+    while s.ends_with('.') || s.ends_with(' ') {
+        s.pop();
+    }
+    let upper = s.to_ascii_uppercase();
+    let base = upper.split('.').next().unwrap_or("");
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if s.is_empty() || RESERVED.contains(&base) {
+        s = format!("Drive {s}");
+    }
+    s
+}
+
+/// The sync root folder to use for a drive (kept stable in the settings).
+pub fn root_for(cfg: &mut Config, d: &DriveInfo) -> PathBuf {
+    if let Some(r) = cfg.roots.get(&d.storage_id) {
+        return r.clone();
+    }
+    let base = roots_base();
+    let name = folder_name(&d.name);
+    let mut cand = base.join(&name);
+    let mut n = 2;
+    while cfg.roots.values().any(|r| r.eq(&cand)) {
+        cand = base.join(format!("{name} ({n})"));
+        n += 1;
+    }
+    cfg.roots.insert(d.storage_id.clone(), cand.clone());
+    cand
+}
+
+/// Start syncing drive `d` into `root`, and alias `root` as a drive letter
+/// (`letter` = None: first free from O:, or none if `want_letter` false).
+#[allow(clippy::too_many_arguments)]
+pub fn mount_drive(
+    api: Api,
+    d: &DriveInfo,
+    root: &Path,
+    letter: Option<char>,
+    want_letter: bool,
+    taken: &[char],
+    data_dir: &Path,
+    paused: Arc<AtomicBool>,
+    opts: EngineOptions,
+) -> Result<Mounted, String> {
+    let engine = Engine::start(api, &d.storage_id, &d.name, root, crate::engine::DEFAULT_ICON, paused, opts)?;
+    let mut m = Mounted {
+        root: engine.root.clone(),
+        engine,
+        letter: None,
+    };
+    if want_letter {
+        let l = letter.or_else(|| letters::choose(&m.root, taken));
+        match l {
+            Some(l) => match letters::map(l, &m.root) {
+                Ok(()) => {
+                    m.letter = Some(l);
+                    if let Err(e) = platform::set_drive_icon(l, None, &d.name) {
+                        tracing::warn!("drive icon for {l}: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("{}: no drive letter: {e}", d.name),
+            },
+            None => tracing::warn!("{}: no free drive letter", d.name),
+        }
+    }
+    // The cover becomes the letter's and the sync root's icon, and is
+    // kept current by the poll loop.
+    m.engine.attach_icons(m.letter, data_dir);
+    tracing::info!(
+        "{} synced at {}{}",
+        d.name,
+        m.root.display(),
+        m.letter.map(|l| format!(" ({l}:)")).unwrap_or_default()
+    );
+    Ok(m)
+}
+
+/// Stop syncing: flush, disconnect, remove the letter. With `remove`, also
+/// unregister the sync root and delete the placeholders (unsynced files
+/// are moved to `aside_base` first).
+pub fn unmount_drive(m: Mounted, remove: bool, aside_base: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(l) = m.letter {
+        letters::unmap(l, &m.root);
+        platform::remove_drive_icon(l);
+    }
+    m.engine.shutdown(Duration::from_secs(30));
+    if remove {
+        m.engine.remove_local(aside_base)
+    } else {
+        Ok(None)
+    }
 }
 
 impl App {
@@ -50,7 +163,6 @@ impl App {
             mounts: HashMap::new(),
             paused,
             backup: None,
-            winfsp: crate::winfsp_loader::load(),
             last_error: None,
         }
     }
@@ -65,7 +177,6 @@ impl App {
         }
     }
 
-    /// The origin to open for "Sign in".
     pub fn sign_in_origin(&self) -> String {
         self.cfg
             .origin
@@ -74,12 +185,10 @@ impl App {
             .unwrap_or_else(config::default_origin)
     }
 
-    /// Whether an auth link for `origin` may be accepted without asking.
     pub fn trusted_origin(&self, origin: &str) -> bool {
         origin == self.sign_in_origin() || origin == config::default_origin()
     }
 
-    /// Exchange a pairing code and store the token.
     pub fn sign_in_with_code(&mut self, code: &str, origin: &str) -> Result<(), String> {
         let r = Api::exchange_code(origin, code, &config::device_name())
             .map_err(|e| format!("sign-in failed: {e}"))?;
@@ -91,23 +200,25 @@ impl App {
             user_email: user.get("email").and_then(|v| v.as_str()).map(String::from),
         };
         config::save_credentials(&self.cfg_dir, &creds)?;
-        // A different account/panel: forget per-drive choices of the old one.
         if self.cfg.origin.as_deref() != Some(origin) {
+            // Another panel/account: remove the old account's folders first.
+            self.remove_all_local();
             self.cfg.org_id = None;
             self.cfg.drives.clear();
             self.cfg.backup.storage_id = None;
         }
         self.cfg.origin = Some(origin.to_string());
         self.save_cfg();
-        self.unmount_all();
         self.creds = Some(creds);
         tracing::info!("signed in to {origin}");
         self.connect()
     }
 
+    /// Sign out: stop everything, unregister every sync root and delete the
+    /// placeholders (anything not uploaded is moved aside first).
     pub fn sign_out(&mut self) {
         self.stop_backup();
-        self.unmount_all();
+        self.remove_all_local();
         config::delete_credentials(&self.cfg_dir);
         self.creds = None;
         self.api = None;
@@ -116,7 +227,36 @@ impl App {
         tracing::info!("signed out");
     }
 
-    /// Load orgs + drives for the stored credentials and mount what's wanted.
+    fn remove_all_local(&mut self) {
+        let base = roots_base();
+        let mounts: Vec<Mounted> = self.mounts.drain().map(|(_, m)| m).collect();
+        for m in mounts {
+            match unmount_drive(m, true, &base) {
+                Ok(Some(aside)) => {
+                    self.last_error = Some(format!("Files that weren't uploaded were moved to {}", aside.display()));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!("{e}");
+                    self.last_error = Some(e);
+                }
+            }
+        }
+        // Sync roots registered earlier but not running now.
+        for (id, root) in crate::cf::our_sync_roots() {
+            if root.as_os_str().is_empty() {
+                let _ = crate::cf::unregister_sync_root(&id);
+                continue;
+            }
+            let label = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if let Err(e) = crate::engine::remove_root(&id, &root, &label, &base) {
+                tracing::error!("{e}");
+            }
+        }
+        self.cfg.roots.clear();
+        self.save_cfg();
+    }
+
     pub fn connect(&mut self) -> Result<(), String> {
         let Some(c) = self.creds.clone() else {
             return Err("not signed in".into());
@@ -159,7 +299,7 @@ impl App {
             return Ok(());
         }
         self.stop_backup();
-        self.unmount_all();
+        self.remove_all_local();
         self.cfg.org_id = Some(org.to_string());
         self.cfg.drives.clear();
         self.cfg.backup.storage_id = None;
@@ -167,7 +307,6 @@ impl App {
         self.connect()
     }
 
-    /// Mount every drive the settings want and that isn't mounted yet.
     pub fn apply_mounts(&mut self) {
         let wanted: Vec<DriveInfo> = self
             .drives
@@ -178,11 +317,10 @@ impl App {
             .collect();
         for d in wanted {
             if let Err(e) = self.mount(&d.storage_id) {
-                tracing::error!("mount {}: {e}", d.name);
+                tracing::error!("sync {}: {e}", d.name);
                 self.last_error = Some(format!("{}: {e}", d.name));
             }
         }
-        // Drives that disappeared from the account.
         let gone: Vec<String> = self
             .mounts
             .keys()
@@ -190,15 +328,14 @@ impl App {
             .cloned()
             .collect();
         for s in gone {
-            self.unmount(&s);
+            self.disable(&s);
         }
     }
 
     pub fn mount(&mut self, storage_id: &str) -> Result<char, String> {
         if let Some(m) = self.mounts.get(storage_id) {
-            return Ok(m.letter);
+            return m.letter.ok_or_else(|| "synced (no drive letter)".into());
         }
-        self.winfsp.clone()?;
         let api = self.api.clone().ok_or("not signed in")?;
         let d = self
             .drives
@@ -206,43 +343,50 @@ impl App {
             .find(|d| d.storage_id == storage_id)
             .cloned()
             .ok_or("no such drive")?;
-        let taken: Vec<char> = self.mounts.values().map(|m| m.letter).collect();
-        let letter = *platform::free_letters(&taken)
-            .first()
-            .ok_or("no free drive letter")?;
+        let root = root_for(&mut self.cfg, &d);
+        let taken: Vec<char> = self.mounts.values().filter_map(|m| m.letter).collect();
         let m = mount_drive(
             api,
             &d,
-            letter,
+            &root,
+            None,
+            true,
+            &taken,
             &self.data_dir,
             self.paused.clone(),
-            DriveOptions::default(),
+            EngineOptions::default(),
         )?;
+        let letter = m.letter;
         self.cfg.drives.insert(storage_id.to_string(), true);
         self.save_cfg();
         self.mounts.insert(storage_id.to_string(), m);
-        Ok(letter)
+        letter.ok_or_else(|| "synced (no free drive letter)".into())
     }
 
-    pub fn unmount(&mut self, storage_id: &str) {
-        if let Some(m) = self.mounts.remove(storage_id) {
-            unmount_drive(m);
-        }
-    }
-
-    /// User toggled a drive off: unmount and remember.
+    /// Stop syncing a drive and remove its local folder (unsynced files are
+    /// moved aside), and remember the choice.
     pub fn disable(&mut self, storage_id: &str) {
-        self.unmount(storage_id);
+        if let Some(m) = self.mounts.remove(storage_id) {
+            if let Err(e) = unmount_drive(m, true, &roots_base()) {
+                self.last_error = Some(e);
+            }
+        }
+        self.cfg.roots.remove(storage_id);
         self.cfg.drives.insert(storage_id.to_string(), false);
         self.save_cfg();
     }
 
+    /// Quit: flush and disconnect every drive, remove the letters (the sync
+    /// roots stay registered and the files stay where they are).
     pub fn unmount_all(&mut self) {
-        // Unmount every letter, then flush all drives' uploads in parallel.
         let mounts: Vec<Mounted> = self.mounts.drain().map(|(_, m)| m).collect();
+        let base = roots_base();
         let handles: Vec<_> = mounts
             .into_iter()
-            .map(|m| std::thread::spawn(move || unmount_drive(m)))
+            .map(|m| {
+                let b = base.clone();
+                std::thread::spawn(move || unmount_drive(m, false, &b))
+            })
             .collect();
         for h in handles {
             let _ = h.join();
@@ -255,8 +399,8 @@ impl App {
         self.save_cfg();
         if !p {
             for m in self.mounts.values() {
-                m.core.poke();
-                m.core.expedite();
+                m.engine.poke();
+                m.engine.expedite();
             }
             if let Some(b) = &self.backup {
                 b.kick();
@@ -283,7 +427,6 @@ impl App {
         }
     }
 
-    /// (Re)start the watcher according to the settings.
     pub fn restart_backup(&mut self) {
         self.stop_backup();
         if !self.cfg.backup.enabled {
@@ -302,9 +445,7 @@ impl App {
             folder,
             storage_id: drive.storage_id.clone(),
             remote,
-            state_path: self
-                .data_dir
-                .join(format!("backup-{}.json", drive.storage_id)),
+            state_path: self.data_dir.join(format!("backup-{}.json", drive.storage_id)),
             settle: Duration::from_secs(3),
         };
         match BackupHandle::start(api, job, self.paused.clone()) {
@@ -334,11 +475,7 @@ impl App {
         self.restart_backup();
     }
 
-    /// One line for the tray.
     pub fn status_line(&self) -> String {
-        if let Err(e) = &self.winfsp {
-            return format!("WinFsp missing: {e}");
-        }
         if !self.signed_in() {
             return "Not signed in".into();
         }
@@ -353,17 +490,17 @@ impl App {
         }
         let mut pending = 0;
         let mut offline = false;
-        let mut uploading = false;
+        let mut busy = false;
         for m in self.mounts.values() {
-            let s = m.core.status();
-            pending += s.pending_uploads;
+            let s = m.engine.status();
+            pending += s.pending;
             offline |= !s.online;
-            uploading |= s.uploading;
+            busy |= s.busy;
         }
         if offline {
             "Offline — changes will upload when back online".into()
-        } else if uploading || pending > 0 {
-            format!("Syncing ({} waiting)", pending + usize::from(uploading))
+        } else if busy || pending > 0 {
+            format!("Syncing ({} waiting)", pending + usize::from(busy))
         } else {
             "Up to date".into()
         }
@@ -375,71 +512,16 @@ impl App {
     }
 }
 
-/// Mount one drive at `letter`: namespace + workers + WinFsp + Explorer icon.
-pub fn mount_drive(
-    api: Api,
-    d: &DriveInfo,
-    letter: char,
-    data_dir: &std::path::Path,
-    paused: Arc<AtomicBool>,
-    opts: DriveOptions,
-) -> Result<Mounted, String> {
-    let core = DriveCore::new(
-        api.clone(),
-        &d.storage_id,
-        &d.name,
-        data_dir.join("cache").join(&d.storage_id),
-        paused,
-        opts,
-    )
-    .map_err(|e| format!("cache: {e}"))?;
-    // First tree before Explorer sees the letter; offline is tolerated (the
-    // poller fills it in when the network is back).
-    if let Err(e) = core.refresh() {
-        tracing::warn!("{}: initial tree failed: {e}", d.name);
-    }
-    core.refresh_volume();
-    core.start_workers();
-    let m = match crate::fs::mount(core.clone(), letter) {
-        Ok(m) => m,
-        Err(e) => {
-            core.stop();
-            return Err(e);
-        }
-    };
-    // Icon: best effort.
-    let ico = if d.has_cover {
-        match api.cover(&d.storage_id) {
-            Ok(Some(bytes)) => match crate::icons::cover_to_ico(&bytes) {
-                Ok(ico) => {
-                    let p = data_dir.join("icons").join(format!("{}.ico", d.storage_id));
-                    let _ = std::fs::create_dir_all(p.parent().unwrap());
-                    std::fs::write(&p, ico).ok().map(|_| p)
-                }
-                Err(e) => {
-                    tracing::warn!("{}: cover: {e}", d.name);
-                    None
-                }
-            },
-            Ok(None) => None,
-            Err(e) => {
-                tracing::warn!("{}: cover download: {e}", d.name);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    if let Err(e) = platform::set_drive_icon(letter, ico.as_deref(), &d.name) {
-        tracing::warn!("drive icon for {letter}: {e}");
-    }
-    Ok(m)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-pub fn unmount_drive(mut m: Mounted) {
-    let letter = m.letter;
-    // Take the letter away first (no new writes), then flush uploads.
-    m.unmount();
-    m.core.shutdown(Duration::from_secs(30));
-    platform::remove_drive_icon(letter);
+    #[test]
+    fn folder_names() {
+        assert_eq!(folder_name("Alice Files"), "Alice Files");
+        assert_eq!(folder_name("a:b?"), "a\u{FF1A}b\u{FF1F}");
+        assert_eq!(folder_name("trailing. "), "trailing");
+        assert_eq!(folder_name("CON"), "Drive CON");
+        assert_eq!(folder_name(""), "Drive");
+    }
 }

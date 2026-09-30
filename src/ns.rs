@@ -53,10 +53,10 @@ impl Node {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Added { path: String, dir: bool },
-    Removed { path: String, dir: bool },
-    Modified { path: String },
-    Renamed { from: String, to: String, dir: bool },
+    Added { path: String, dir: bool, rid: String },
+    Removed { path: String, dir: bool, rid: String },
+    Modified { path: String, rid: String },
+    Renamed { from: String, to: String, dir: bool, rid: String },
 }
 
 #[derive(Debug, Default)]
@@ -471,13 +471,14 @@ impl Namespace {
             }
             let path = self.path_of(id);
             let dir = n.is_dir;
+            let rid = n.remote_id.clone().unwrap_or_default();
             let removed = self.remove(id);
             for r in removed {
                 if r.is_file() && !r.cache_key.is_empty() {
                     res.removed.push(r.cache_key);
                 }
             }
-            res.changes.push(Change::Removed { path, dir });
+            res.changes.push(Change::Removed { path, dir, rid });
         }
 
         // 2. Folders, parents first.
@@ -529,7 +530,7 @@ impl Namespace {
                 let from = self.path_of(id);
                 self.move_node(id, parent, &shown);
                 let to = self.path_of(id);
-                res.changes.push(Change::Renamed { from, to, dir: true });
+                res.changes.push(Change::Renamed { from, to, dir: true, rid: fid.to_string() });
             }
             id
         } else {
@@ -547,6 +548,7 @@ impl Namespace {
             res.changes.push(Change::Added {
                 path: self.path_of(id),
                 dir: true,
+                rid: fid.to_string(),
             });
             id
         };
@@ -582,7 +584,7 @@ impl Namespace {
                 let from = self.path_of(id);
                 self.move_node(id, parent, &shown);
                 let to = self.path_of(id);
-                res.changes.push(Change::Renamed { from, to, dir: false });
+                res.changes.push(Change::Renamed { from, to, dir: false, rid: f.file_id.clone() });
             }
             let n = self.nodes.get_mut(&id).unwrap();
             n.remote_name = f.name.clone();
@@ -599,7 +601,7 @@ impl Namespace {
                     n.remote_tag = tag;
                     res.invalidated.push(n.cache_key.clone());
                     let path = self.path_of(id);
-                    res.changes.push(Change::Modified { path });
+                    res.changes.push(Change::Modified { path, rid: f.file_id.clone() });
                 }
             }
         } else {
@@ -620,6 +622,7 @@ impl Namespace {
             res.changes.push(Change::Added {
                 path: self.path_of(id),
                 dir: false,
+                rid: f.file_id.clone(),
             });
         }
     }
@@ -696,20 +699,24 @@ mod tests {
         ));
         assert!(r.changes.contains(&Change::Removed {
             path: "\\Docs\\b.txt".into(),
-            dir: false
+            dir: false,
+            rid: "b".into()
         }));
         assert!(r.changes.contains(&Change::Renamed {
             from: "\\Docs".into(),
             to: "\\Papers".into(),
-            dir: true
+            dir: true,
+            rid: "f1".into()
         }));
         assert!(r.changes.contains(&Change::Renamed {
             from: "\\a.txt".into(),
             to: "\\Papers\\a2.txt".into(),
-            dir: false
+            dir: false,
+            rid: "a".into()
         }));
         assert!(r.changes.contains(&Change::Modified {
-            path: "\\Papers\\a2.txt".into()
+            path: "\\Papers\\a2.txt".into(),
+            rid: "a".into()
         }));
         assert_eq!(r.invalidated, vec!["a".to_string()]);
         assert_eq!(r.removed, vec!["b".to_string()]);

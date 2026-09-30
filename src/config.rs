@@ -38,9 +38,12 @@ pub struct Config {
     pub origin: Option<String>,
     #[serde(default)]
     pub org_id: Option<String>,
-    /// storageId -> mount it? (absent = yes)
+    /// storageId -> sync it? (absent = yes)
     #[serde(default)]
     pub drives: HashMap<String, bool>,
+    /// storageId -> its sync root folder (chosen once, then kept).
+    #[serde(default)]
+    pub roots: HashMap<String, PathBuf>,
     #[serde(default)]
     pub paused: bool,
     #[serde(default)]

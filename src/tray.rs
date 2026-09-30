@@ -85,14 +85,17 @@ fn build_menu(a: &App) -> Menu {
         for d in &a.drives {
             let mounted = a.mounts.get(&d.storage_id);
             let title = match mounted {
-                Some(m) => format!("{} ({}:)", d.name, m.letter),
+                Some(m) => match m.letter {
+                    Some(l) => format!("{} ({l}:)", d.name),
+                    None => format!("{} (synced)", d.name),
+                },
                 None => d.name.clone(),
             };
             let sub = Submenu::new(title, true);
             let _ = sub.append(&CheckMenuItem::with_id(
                 format!("mount:{}", d.storage_id),
-                "Mounted",
-                a.winfsp.is_ok(),
+                "Sync this drive",
+                true,
                 mounted.is_some(),
                 None,
             ));
@@ -190,7 +193,7 @@ fn build_menu(a: &App) -> Menu {
 }
 
 fn tray_state(a: &App) -> u8 {
-    if a.winfsp.is_err() || a.last_error.is_some() && a.api.is_none() {
+    if a.last_error.is_some() && a.api.is_none() {
         2
     } else if a.paused.load(Ordering::Relaxed) || !a.signed_in() {
         1
@@ -381,7 +384,11 @@ pub fn run(app: Shared, initial_link: Option<String>) {
                             });
                         } else if let Some(sid) = other.strip_prefix("open:") {
                             if let Some(m) = app.lock().mounts.get(sid) {
-                                platform::open_in_explorer(&format!("{}:\\", m.letter));
+                                let target = match m.letter {
+                                    Some(l) => format!("{l}:\\"),
+                                    None => m.root.display().to_string(),
+                                };
+                                platform::open_in_explorer(&target);
                             }
                         } else if let Some(sid) = other.strip_prefix("backupdrive:") {
                             let sid = sid.to_string();

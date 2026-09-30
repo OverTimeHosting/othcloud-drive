@@ -2,7 +2,7 @@
 name = "othcloud-drive"
 version = "0.1.0"
 edition = "2021"
-description = "OTHCloud Drive: mounts OTHCloud drives as Windows drive letters (WinFsp) with two-way sync"
+description = "OTHCloud Drive: OTHCloud drives as Windows cloud-file folders (Cloud Files API) with drive letters and two-way sync"
 license = "UNLICENSED"
 publish = false
 
@@ -15,8 +15,16 @@ name = "othcloud-drive"
 path = "src/main.rs"
 
 [dependencies]
-winfsp = "0.13"
 windows = { version = "0.61", features = [
+    "Foundation",
+    "Security_Cryptography",
+    "Storage",
+    "Storage_Provider",
+    "Storage_Search",
+    "Foundation_Collections",
+    "Storage_Streams",
+    "Win32_Storage_CloudFilters",
+    "Win32_System_CorrelationVector",
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",

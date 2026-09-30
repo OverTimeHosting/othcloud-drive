@@ -177,6 +177,21 @@ pub fn set_drive_icon(letter: char, ico: Option<&Path>, label: &str) -> std::io:
     Ok(())
 }
 
+/// Tell Explorer a folder's (sync root's) look changed.
+pub fn shell_refresh_path(path: &Path) {
+    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW};
+    let w: Vec<u16> = path
+        .display()
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(w.as_ptr() as *const _), None);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(w.as_ptr() as *const _), None);
+    }
+}
+
 /// Remove what `set_drive_icon` wrote (only if it carries our marker).
 pub fn remove_drive_icon(letter: char) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);

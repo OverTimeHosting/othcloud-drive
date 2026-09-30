@@ -9,11 +9,14 @@
 //!                                          running instance if there is one)
 //!   othcloud-drive quit                    ask the running instance to quit
 //!   othcloud-drive mount --origin URL --token T --org ORG --storage ID
-//!                  [--storage ID…] [--letter L] [--poll-secs N]
-//!                  [--stop-file PATH]      headless mount (testing/scripting)
+//!                  [--storage ID…] [--root DIR…] [--letter L…] [--no-letter]
+//!                  [--poll-secs N] [--stop-file PATH] [--remove-on-exit]
+//!                  [--provider-id ID] [--cover-secs N]
+//!                                          headless sync (testing/scripting)
 //!   othcloud-drive register                (re)register the URL scheme
+//!   othcloud-drive cleanup-test-roots      dev: remove test sync roots/letters
 
-use othcloud_drive::{api, app, drive, ipc, platform, tray};
+use othcloud_drive::{api, app, engine, ipc, platform, tray};
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -93,20 +96,21 @@ fn headless_mount(args: &[String]) -> i32 {
         .unwrap_or_else(|| need("--token"));
     let org = need("--org");
     let storages = arg_values(args, "--storage");
-    let letters: Vec<char> = arg_values(args, "--letter")
+    let letters_arg: Vec<char> = arg_values(args, "--letter")
         .iter()
         .filter_map(|l| l.chars().next())
         .map(|c| c.to_ascii_uppercase())
         .collect();
+    let roots_arg = arg_values(args, "--root");
+    let no_letter = args.iter().any(|a| a == "--no-letter");
+    let remove = args.iter().any(|a| a == "--remove-on-exit");
+    let provider = arg_value(args, "--provider-id").unwrap_or_else(|| othcloud_drive::cf::PROVIDER.to_string());
+    let cover_secs = arg_value(args, "--cover-secs").and_then(|s| s.parse().ok()).unwrap_or(60u64);
     let poll = arg_value(args, "--poll-secs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(15u64);
     let stop_file = arg_value(args, "--stop-file").map(std::path::PathBuf::from);
 
-    if let Err(e) = othcloud_drive::winfsp_loader::load() {
-        eprintln!("{e}");
-        return 3;
-    }
     let api = api::Api::new(&origin, &token, Some(org));
     let drives = match api.drives() {
         Ok(d) => d,
@@ -119,35 +123,48 @@ fn headless_mount(args: &[String]) -> i32 {
     let data_dir = platform::data_dir();
     let mut mounts = Vec::new();
     let mut used: Vec<char> = Vec::new();
+    let mut cfg = othcloud_drive::config::Config::default();
     for (i, sid) in storages.iter().enumerate() {
         let Some(d) = drives.iter().find(|d| &d.storage_id == sid) else {
-            eprintln!("no drive {sid} (have: {:?})", drives.iter().map(|d| &d.storage_id).collect::<Vec<_>>());
+            eprintln!(
+                "no drive {sid} (have: {:?})",
+                drives.iter().map(|d| &d.storage_id).collect::<Vec<_>>()
+            );
             return 4;
         };
-        let letter = match letters.get(i) {
-            Some(l) => *l,
-            None => match platform::free_letters(&used).first() {
-                Some(l) => *l,
-                None => {
-                    eprintln!("no free drive letter");
-                    return 5;
-                }
-            },
+        let root = match roots_arg.get(i) {
+            Some(r) => std::path::PathBuf::from(r),
+            None => app::root_for(&mut cfg, d),
         };
-        let opts = drive::DriveOptions {
+        let opts = engine::EngineOptions {
             poll_interval: Duration::from_secs(poll),
+            provider: provider.clone(),
+            cover_interval: Duration::from_secs(cover_secs),
             ..Default::default()
         };
-        match app::mount_drive(api.clone(), d, letter, &data_dir, paused.clone(), opts) {
+        match app::mount_drive(
+            api.clone(),
+            d,
+            &root,
+            letters_arg.get(i).copied(),
+            !no_letter,
+            &used,
+            &data_dir,
+            paused.clone(),
+            opts,
+        ) {
             Ok(m) => {
-                println!("MOUNTED {} {}:", sid, m.letter);
-                used.push(m.letter);
+                let l = m.letter.map(|l| format!("{l}:")).unwrap_or_else(|| "-".into());
+                println!("MOUNTED {} {} {}", sid, l, m.root.display());
+                if let Some(l) = m.letter {
+                    used.push(l);
+                }
                 mounts.push(m);
             }
             Err(e) => {
                 eprintln!("mount {sid}: {e}");
                 for m in mounts {
-                    app::unmount_drive(m);
+                    let _ = app::unmount_drive(m, remove, &app::roots_base());
                 }
                 return 6;
             }
@@ -182,11 +199,19 @@ fn headless_mount(args: &[String]) -> i32 {
             }
         }
     }
+    let mut code = 0;
     for m in mounts {
-        app::unmount_drive(m);
+        match app::unmount_drive(m, remove, &app::roots_base()) {
+            Ok(Some(aside)) => println!("NOT-UPLOADED-MOVED-TO {}", aside.display()),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("{e}");
+                code = 7;
+            }
+        }
     }
-    println!("UNMOUNTED");
-    0
+    println!("UNMOUNTED{}", if remove { " REMOVED" } else { "" });
+    code
 }
 
 fn main() {
@@ -197,6 +222,13 @@ fn main() {
         attach_console();
         let _g = init_logging(true);
         std::process::exit(headless_mount(&args[1..]));
+    }
+    if first == "cleanup-test-roots" {
+        attach_console();
+        for line in cleanup_test_roots() {
+            println!("{line}");
+        }
+        return;
     }
     if first == "register" {
         attach_console();
@@ -247,13 +279,44 @@ fn main() {
         }
     }
     let app = app::App::load();
-    if let Err(e) = &app.winfsp {
-        tracing::error!("{e}");
-        // Non-blocking: the tray still starts (sign-in and photo backup
-        // work without WinFsp).
-        let msg = format!("{e}\n\nDrives can't be mounted until WinFsp is installed.");
-        std::thread::spawn(move || platform::message_box("OTHCloud Drive", &msg, true));
-    }
     let app = Arc::new(Mutex::new(app));
     tray::run(app, link);
+}
+
+/// Dev/test only: remove every sync root registered under the TEST provider
+/// id (never the app's own), any drive letter aliasing into one (with its
+/// Explorer label/icon keys), and the root folder itself if it's under %TEMP%.
+fn cleanup_test_roots() -> Vec<String> {
+    use othcloud_drive::{cf, letters};
+    let mut out = Vec::new();
+    let temp = std::env::temp_dir().display().to_string().to_lowercase();
+    for (id, root) in cf::sync_roots(cf::TEST_PROVIDER) {
+        let rs = root.display().to_string().to_lowercase();
+        if !rs.is_empty() {
+            for l in 'A'..='Z' {
+                if let Some(t) = letters::root_of(l) {
+                    let ts = t.display().to_string().to_lowercase();
+                    if ts == rs || ts.starts_with(&format!("{rs}\\")) {
+                        letters::unmap(l, &t);
+                        platform::remove_drive_icon(l);
+                        out.push(format!("removed letter {l}: -> {}", t.display()));
+                    }
+                }
+            }
+        }
+        match cf::unregister_sync_root(&id) {
+            Ok(()) => out.push(format!("unregistered {id}")),
+            Err(e) => out.push(format!("{id}: {e}")),
+        }
+        if !rs.is_empty() && rs.starts_with(&temp) && root.exists() {
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => out.push(format!("deleted {}", root.display())),
+                Err(e) => out.push(format!("{}: {e}", root.display())),
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push("no test sync roots".into());
+    }
+    out
 }

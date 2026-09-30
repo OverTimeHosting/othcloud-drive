@@ -114,6 +114,9 @@ pub struct DriveInfo {
     pub quota_bytes: Option<u64>,
     #[serde(default)]
     pub has_cover: bool,
+    /// Accent colour ("#38bdf8") or null.
+    #[serde(default)]
+    pub color: Option<String>,
     #[serde(default)]
     pub updated_at: Option<String>,
 }
@@ -342,6 +345,30 @@ impl Api {
         }
     }
 
+    /// Revalidate the cover: `etag` is the one last seen (If-None-Match).
+    pub fn cover_if(&self, storage_id: &str, etag: Option<&str>) -> ApiResult<Cover> {
+        let mut rb = self
+            .req(&self.http, reqwest::Method::GET, "cover")
+            .query(&[("storageId", storage_id)]);
+        if let Some(e) = etag.filter(|e| !e.is_empty()) {
+            rb = rb.header("If-None-Match", e);
+        }
+        match Self::send(rb) {
+            Ok(resp) if resp.status().as_u16() == 304 => Ok(Cover::NotModified),
+            Ok(resp) => {
+                let etag = resp
+                    .headers()
+                    .get("etag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let bytes = resp.bytes().map_err(from_reqwest)?.to_vec();
+                Ok(Cover::Image { bytes, etag })
+            }
+            Err(e) if e.is_not_found() => Ok(Cover::None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Whole-drive tree. `Ok(None)` means 304 Not Modified for `etag`.
     pub fn tree(&self, storage_id: &str, etag: Option<&str>) -> ApiResult<Option<Tree>> {
         let mut rb = self
@@ -542,6 +569,16 @@ impl Api {
             Err(e) => Err(e),
         }
     }
+}
+
+/// Result of revalidating a drive's cover image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Cover {
+    /// 304: same as the ETag we sent.
+    NotModified,
+    Image { bytes: Vec<u8>, etag: Option<String> },
+    /// 404: the drive has no cover.
+    None,
 }
 
 /// A file row from a write endpoint; every field optional so a terse server

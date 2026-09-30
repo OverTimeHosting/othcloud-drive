@@ -1,49 +1,51 @@
 # OTHCloud Drive (Windows)
 
-Mounts your OTHCloud drives as drive letters in Windows Explorer, with
-two-way sync. Each OTHCloud drive gets its **own** letter (from `O:` upward,
-skipping taken letters), labelled with the drive's name and shown with the
-drive's cover image as its icon.
+Puts your OTHCloud drives in Windows Explorer with two-way sync, the way
+OneDrive does it: each OTHCloud drive is a **cloud-files folder**
+(`%USERPROFILE%\OTHCloud\<drive name>`) whose files are downloaded only when
+you open them, and each is **also its own drive letter** (from `O:` upward),
+labelled with the drive's name and shown with the drive's cover (or colour)
+as its icon.
+
+It is a Windows *cloud files provider* built on the Cloud Files API
+(`cldapi.dll`, part of Windows 10 1809+ / 11). **Nothing to install besides
+the app**: no WinFsp, no kernel driver, no Visual C++ runtime (the CRT is
+linked statically).
 
 The contract with the panel is [PROTOCOL.md](PROTOCOL.md).
-
-## Requirements
-
-- Windows 10/11 x64.
-- **[WinFsp](https://winfsp.dev/rel/) 2.x** installed (the user-mode
-  filesystem driver). The app starts without it (sign-in and photo backup
-  still work) but can't mount drives, and says so.
 
 ## Build
 
 ```powershell
-# Rust (stable) + the MSVC build tools, and:
-winget install LLVM.LLVM        # libclang, needed by winfsp-sys's bindgen
-$env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin"
-cargo build --release           # target\release\othcloud-drive.exe
+cargo build --release     # target\release\othcloud-drive.exe
 ```
 
-WinFsp does **not** need to be installed to build: `winfsp-sys` ships the
-headers and import library, and the DLL is delay-loaded at runtime from the
-WinFsp install directory (`src/winfsp_loader.rs`, `build.rs`).
+Plain stable Rust + the MSVC build tools. (No LLVM/libclang any more — that
+was only needed by the old WinFsp bindings.)
 
-Tests:
+Tests (they register real, clearly-named `OTHCloudDriveTest!…` sync roots in
+temp folders and always unregister them, even when a test fails):
 
 ```powershell
-cargo test                      # unit + integration tests against the in-memory mock server
+cargo test                      # unit + integration tests (mock server, real cfapi)
 cargo clippy --all-targets
 
-# The same flows against a real panel (opt-in):
-$env:OTHCLOUD_REAL_PANEL = "http://127.0.0.1:3900"
-$env:OTHCLOUD_REAL_TOKEN = "…"; $env:OTHCLOUD_REAL_ORG = "…"; $env:OTHCLOUD_REAL_STORAGE = "…"
+# The engine against a real panel (opt-in):
+$env:OTHCLOUD_REAL_PANEL = "http://127.0.0.1:3900"   # + OTHCLOUD_REAL_TOKEN / _ORG / _STORAGE
 cargo test --test real_panel -- --test-threads=1
+
+# End-to-end, driving the drive letter and the folder from PowerShell:
+powershell -File scripts\mount-test.ps1 -Mock
+powershell -File scripts\mount-test.ps1 -Origin http://127.0.0.1:3900 -Token … -Org … -Storage … [-Psql path\to\psql.exe]
 ```
 
-The mock server (`tests/common/mock.rs`) implements PROTOCOL.md in memory
-and can be run on its own for manual testing:
+Dev helpers:
 
 ```powershell
-cargo run --example mock_server -- 8787   # prints origin, token, org, drive ids
+cargo run --example mock_server -- 8787          # in-memory PROTOCOL.md server
+cargo run --example sync_roots                   # list this app's sync roots
+cargo run --example render_icons -- <out dir>    # sample drive icons + contact sheet
+othcloud-drive cleanup-test-roots                # remove any OTHCloudDriveTest roots/letters
 ```
 
 ## Run
@@ -52,137 +54,156 @@ cargo run --example mock_server -- 8787   # prints origin, token, org, drive ids
 othcloud-drive.exe              # tray app (single instance)
 ```
 
-Command-line modes (mostly for scripting and testing):
-
 | Command | What it does |
 |---|---|
 | `othcloud-drive "othcloud-drive://auth?code=…&origin=…"` | sign-in link (Windows runs this for you; handed to the running instance if there is one) |
-| `othcloud-drive quit` | ask the running instance to unmount and quit |
+| `othcloud-drive quit` | ask the running instance to flush, disconnect and quit |
 | `othcloud-drive register` | (re)register the `othcloud-drive://` URL scheme for this user |
-| `othcloud-drive mount --origin URL --token T --org ORG --storage ID [--storage ID…] [--letter L…] [--poll-secs N] [--stop-file PATH]` | headless mount without the tray; unmounts on `quit`/EOF on stdin or when the stop file appears |
+| `othcloud-drive mount --origin URL --token T --org ORG --storage ID [--storage ID…] [--root DIR…] [--letter L…] [--no-letter] [--poll-secs N] [--cover-secs N] [--stop-file PATH] [--remove-on-exit] [--provider-id ID]` | headless sync without the tray; prints `MOUNTED <storageId> <L>: <path>`; stops on `quit`/EOF or when the stop file appears |
+| `othcloud-drive cleanup-test-roots` | dev: unregister test sync roots (provider `OTHCloudDriveTest`) and their letters |
 
 Environment overrides: `OTHCLOUD_ORIGIN` (panel to sign in to, default
 `https://othcloud.xyz`), `OTHCLOUD_DRIVE_LOG` (tracing filter, default
-`info`), `OTHCLOUD_DRIVE_CONFIG_DIR` / `OTHCLOUD_DRIVE_DATA_DIR` (relocate
-settings / cache, used by tests).
+`info`), `OTHCLOUD_DRIVE_CONFIG_DIR` / `OTHCLOUD_DRIVE_DATA_DIR` /
+`OTHCLOUD_DRIVE_ROOT_BASE` (relocate settings / data / the `OTHCloud` folder),
+`OTHCLOUD_DRIVE_PIPE` / `OTHCLOUD_DRIVE_MUTEX` (single-instance names).
 
-### The tray menu
+### Tray menu
 
-Status line · one submenu per drive (**Mounted** toggle, **Open in
+Status line · one submenu per drive (**Sync this drive** toggle, **Open in
 Explorer**) · **Pause sync** · **Photo backup** (on/off, folder picker,
-which drive to upload to, last result) · **Organization** (if you're in
-more than one) · Open OTHCloud in browser · Sign out · Open log folder ·
-Quit (flushes pending uploads, unmounts, removes the drive icons).
+target drive, last result) · **Organization** (if more than one) · Open
+OTHCloud in browser · Sign out · Open log folder · Quit.
+
+## How it works
+
+- **Sync roots.** Each drive is registered with the shell
+  (`StorageProviderSyncRootManager`) as sync root
+  `OTHCloudDrive!<SID>!<storageId>` with hydration policy **Progressive** and
+  population policy **AlwaysFull**. The protocol only offers the whole
+  `tree`, so every file and folder becomes a placeholder up front; listing,
+  search and thumbnails-of-cached-files work offline, and nothing is
+  downloaded to show a folder.
+- **Drive letters.** Each sync root folder is aliased as a drive letter
+  with `subst` semantics (`DefineDosDeviceW` in the user's session): the
+  letter is just another path to the same NTFS folder, so hydration,
+  pinning and uploads behave identically through it (the test suite reads,
+  writes, copies in and out through both). Letters don't survive logoff; the
+  app re-creates them at every start and removes them on quit. The letter's
+  Explorer label/icon: `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>`.
+- **Reads (hydration).** On first access Windows asks the app for the file's
+  data (FETCH_DATA); it streams exactly the requested ranges from `GET file`
+  (≤ 4 MiB per request). The placeholder file *is* the cache.
+  **Free up space** / **Always keep on this device** in Explorer
+  (`attrib +U` / `attrib +P`) dehydrate / hydrate files.
+- **Remote changes** (polled every ~15 s with `If-None-Match`): new items
+  become placeholders; changed files are updated and dehydrated (re-fetched
+  on next open); renames/moves and deletes are applied locally. A file with
+  local changes that aren't uploaded yet is never overwritten or deleted.
+- **Local changes.** Renames/moves and deletes of synced items arrive as
+  platform callbacks and go to the server immediately (`POST move`;
+  `DELETE item` after a few seconds' grace). New and modified files and
+  folders are picked up by a directory watcher (plus a periodic rescan),
+  uploaded (`PUT file`, create or replace, always with `Content-Length`) and
+  then turned into in-sync placeholders.
+- **Office / editor saves keep the file's server id.** Scratch files (`~$*`,
+  `*.tmp`, `.~lock.*`, `*.crdownload`, `*.part(ial)`, `Thumbs.db`,
+  `desktop.ini`) are never uploaded. Word/Excel's "rename the original to
+  `~WRL0001.tmp`, rename the new file into place, delete the original" and
+  editors' `MoveFileEx(REPLACE_EXISTING)` are recognised: the new bytes are
+  written into the original server file (`PUT file?fileId=`), so shares and
+  links survive and no temp file reaches the server.
+- **Conflicts.** If a new local file's name is already taken on the server
+  by a different file, it's uploaded as
+  `name (conflicted copy <PC> <time>).ext`. A file edited locally that also
+  changed on the server: local wins (logged).
+- **Offline.** Hydrated files stay readable; opening one that was never
+  downloaded fails with "the network is unavailable". New and edited files
+  are queued and uploaded with backoff when the server is reachable again.
+- **Drive icons.** The drive's cover (revalidated with `If-None-Match`
+  about once a minute) in a rounded tile with an OTHCloud badge; without a
+  cover, a tile in the drive's colour with the OTH logo. The same `.ico` is
+  used for the drive letter and the sync root's sidebar entry; a cover or
+  colour change writes a new file name (Explorer caches icons by path),
+  repoints both, deletes the old file and notifies the shell.
+- **Pause sync** stops polling, uploads and remote deletes; opening files
+  and renames/deletes still reach the server.
 
 ## How sign-in works
 
-1. The tray's **Sign in…** opens `<panel>/dashboard/apps/storage` in your
-   browser. There, **Connect Windows app** creates a one-shot pairing code
-   and navigates to `othcloud-drive://auth?code=…&origin=…`.
+1. The tray's **Sign in…** opens `<panel>/dashboard/apps/storage`; **Connect
+   Windows app** there makes a one-shot pairing code and opens
+   `othcloud-drive://auth?code=…&origin=…`.
 2. Windows starts `othcloud-drive.exe` with that link (the scheme is
-   registered per-user under `HKCU\Software\Classes\othcloud-drive` on every
-   start). If the app is already running, the new process hands the link to
-   it over a per-user named pipe and exits.
-3. The app exchanges the code at `<origin>/api/desktop/token` (device name
-   `OTHCloud Drive (<PC name>)`) for a long-lived token. A link for a panel
-   other than the one you last used (or `OTHCLOUD_ORIGIN`) asks for
-   confirmation first, so a random web page can't silently point the app at
-   another server.
-4. The token is stored encrypted with DPAPI for your Windows account. The
-   first organization is used; switch in the tray menu.
+   registered per user under `HKCU\Software\Classes\othcloud-drive` at every
+   start); a running instance receives it over a per-user named pipe.
+3. The code is exchanged at `<origin>/api/desktop/token` for a long-lived
+   token (device name `OTHCloud Drive (<PC name>)`). A link for a panel other
+   than the configured one asks for confirmation first.
+4. The token is stored with DPAPI (current Windows user). The first
+   organization is used; switch in the tray.
 
-Sign out deletes the stored token (revoke it in the panel to invalidate it
-everywhere).
+**Sign out** stops syncing, unregisters every sync root and deletes the
+placeholders. Anything not uploaded yet is first copied to
+`%USERPROFILE%\OTHCloud\Not uploaded - <drive> - <time>` (and the log says
+so) — nothing unsynced is ever deleted. Revoke the token in the panel to
+invalidate it everywhere.
 
 ## Where data lives
 
 | What | Where |
 |---|---|
+| Synced drives | `%USERPROFILE%\OTHCloud\<drive name>` (one sync root each) + a drive letter per drive |
 | Settings | `%APPDATA%\OTHCloud Drive\config.json` |
-| Token (DPAPI-encrypted) | `%APPDATA%\OTHCloud Drive\credentials.bin` |
-| File cache | `%LOCALAPPDATA%\OTHCloud Drive\cache\<storageId>\<fileId>.bin` (+ `.json` chunk map) |
-| Drive icons | `%LOCALAPPDATA%\OTHCloud Drive\icons\<storageId>.ico` |
+| Token (DPAPI) | `%APPDATA%\OTHCloud Drive\credentials.bin` |
+| Drive icons | `%LOCALAPPDATA%\OTHCloud Drive\icons\<storageId>-<hash>.ico` |
 | Photo backup state | `%LOCALAPPDATA%\OTHCloud Drive\backup-<storageId>.json` |
 | Logs (daily, 14 kept) | `%LOCALAPPDATA%\OTHCloud Drive\logs\` |
-| Explorer icon/label | `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>\DefaultIcon`, `\DefaultLabel` (written on mount, removed on unmount) |
-
-## How syncing works
-
-- **Listing** comes from the drive's whole `tree`, fetched at mount and
-  then every 15 s with `If-None-Match` (a 304 is cheap). Changes made
-  elsewhere appear after the next poll, and Explorer windows are told
-  (WinFsp change notifications). Lookups are case-insensitive; case is
-  preserved.
-- **Reading** fetches only the byte ranges that are read (1 MiB chunks, a
-  small read-ahead) into a sparse cache file keyed by file id. Cached bytes
-  stay valid until the file changes on the server (size/updatedAt), so
-  they're readable offline.
-- **Writing** goes to the cache; before the first write to a file that
-  isn't fully cached, the rest is downloaded. The file is uploaded (streamed
-  from the cache with a Content-Length) about 2 s after the last handle
-  closes / is flushed — `PUT file?fileId=` for existing files (same id,
-  shares kept), `PUT file?storageId=…` for new ones.
-- **Create folder / rename / move / delete** call the API immediately.
-  Renaming over an existing file (`MoveFileEx` with replace) is mapped so
-  the file **keeps its server id**: the new bytes are uploaded into the old
-  file rather than deleting it.
-- **Office / editor save patterns.** Files created under scratch names
-  (`~$*`, `*.tmp`, `.~lock.*`, `*.crdownload`, `*.part(ial)`, `Thumbs.db`,
-  `desktop.ini`) are **kept local** and never uploaded unless renamed to a
-  normal name. Renaming an existing file to a scratch name (Word/Excel move
-  the original to `~WRL0001.tmp` before putting the new version in place)
-  is kept local too, so when the new version is renamed to the original
-  name it replaces the original's contents under the same id and nothing
-  temporary ever reaches the server. Tested for Word's
-  `~WRD/~WRL` dance, Excel's extension-less temp file, and the
-  "write `x.new`, rename over `x`" editor pattern.
-- **Conflicts.** If a new file's name was taken on the server meanwhile,
-  it's uploaded as `name (conflicted copy <PC> <time>).ext`. If a file with
-  unsent local edits changed on the server too, the local copy wins (logged).
-- **Offline.** Cached files stay readable; reading something not cached
-  fails with "network unreachable". New files, edits and deletes are queued
-  and retried with backoff (up to 5 min); folders created offline are
-  created on the server later. The tray shows the state.
-- **Pause sync** stops polling and uploads; reads (and create/rename/delete,
-  which are immediate API calls) still work.
-- Names the server allows but Windows doesn't (`<>:"|?*` from browser
-  uploads) are shown with full-width look-alike characters; the server name
-  is untouched. If a folder contains two names that differ only by case (or
-  a file and a folder with the same name), only one is shown.
+| Shell registration | `HKLM\…\Explorer\SyncRootManager\OTHCloudDrive!<SID>!<storageId>` (written by Windows on the app's behalf; no admin rights needed) |
+| Letter label/icon | `HKCU\Software\Classes\Applications\Explorer.exe\Drives\<L>` |
 
 ## Photo backup
 
-Off by default. When on, it watches a folder (default: your Pictures)
-recursively and uploads new or changed images (jpg, png, heic, webp, gif,
-tiff, avif, and common camera-raw formats) to
-`<chosen drive>/Photo backup/<PC name>/<same sub-folders>/`, creating
-folders as needed. It remembers what it uploaded (path, size, mtime, file
-id) so restarts don't re-upload; a changed photo replaces its earlier upload
-in place. It **never deletes anything** on the server. A same-named but
-different file already there is kept and the new one uploaded as
-`name (1).ext`. Network errors back off (5 s … 10 min) and retry.
+Off by default. Watches a folder (default: Pictures) recursively and uploads
+new or changed images (jpg, png, heic, webp, gif, tiff, avif, camera raw) to
+`<chosen drive>/Photo backup/<PC name>/<same sub-folders>/`. Remembers what
+it uploaded (path, size, mtime, file id), replaces an edited photo in place,
+keeps a same-named different file (uploads `name (1).ext`), backs off on
+network errors, and **never deletes anything** on the server.
 
 ## Limitations (v1)
 
-- Needs WinFsp installed separately (see Installer below).
-- The upload queue isn't persisted: if you quit while offline, edits made
-  since stay in the cache but aren't re-uploaded on the next start (Quit
-  waits up to 30 s per drive for pending uploads when online).
-- No cache eviction yet: the cache grows with what you open. Delete the
-  cache folder while the app isn't running to reclaim space.
-- Timestamps you set locally (e.g. by `robocopy /COPY:T`) are shown locally
-  but not stored on the server (the protocol has no field for them).
-- ACLs, alternate data streams, hard links, reparse points and extended
-  attributes aren't supported.
-- A file edited locally while it also changed on the server: local wins.
-- Only one account at a time; one organization at a time.
+- Windows asks for whole files on first access (even with a
+  Partial/Progressive policy): opening a large video starts its full
+  download, streamed range by range.
+- The upload queue isn't persisted across restarts; files still unsynced at
+  quit are found again by the start-up scan (they aren't in-sync
+  placeholders) and uploaded then.
+- Pause also doesn't block renames/deletes (the platform needs an answer
+  for those immediately).
+- A file edited locally while it changed on the server: local wins.
+- Timestamps set locally aren't stored on the server (no protocol field).
+- Names the server allows but Windows doesn't (`<>:"|?*` from browser
+  uploads) are shown with full-width look-alikes; two names differing only
+  by case (or a file and folder with the same name) show only one.
+- Moving a file OUT of a drive folder deletes it from the server (like
+  OneDrive); moving files between two OTHCloud drives is a delete + upload.
+- One account and one organization at a time.
+- The drive letter needs a free letter; the folder under
+  `%USERPROFILE%\OTHCloud` always works.
 
 ## Installer note
 
-WinFsp is a prerequisite. For a proper installer (MSI/MSIX or Inno Setup),
-bundle the WinFsp MSI (`winfsp-2.x.msi`, redistributable under WinFsp's
-FLOSS exception — check the current licence terms) and run it silently
-(`msiexec /i winfsp.msi /qn INSTALLLEVEL=1000`) before installing
-`othcloud-drive.exe`, then add a per-user Run key or Startup shortcut so the
-tray starts at sign-in. The URL scheme is registered by the app itself on
-every start, so the installer doesn't need to.
+Only the exe is needed (plus a Start-menu / per-user Run entry so the tray
+starts at sign-in). No drivers or prerequisites: the Cloud Files API ships
+with Windows 10 1809+ and Windows 11, and the C runtime is statically linked.
+The app registers its URL scheme itself at every start. An uninstaller
+should run the app's sign-out path first (unregisters the sync roots,
+removes letters and placeholders, keeps unsynced files) before deleting the
+exe.
+
+## Licences
+
+All dependencies are permissively licensed (MIT / Apache-2.0 / BSD /
+ISC / Zlib / Unicode-3.0 / CC0 / CDLA-Permissive-2.0); nothing GPL, LGPL,
+AGPL or MPL. The OTH logo in `assets/` is the project's own brand asset.
