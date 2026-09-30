@@ -1,0 +1,64 @@
+name: Build
+
+# Every push/PR: lint, test, and build the release exe (downloadable as the
+# run's artifact). A tag like v0.1.0 also publishes a GitHub Release with the
+# exe attached.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Unit tests, photo backup, and the engine tests (which register real
+      # Cloud Files sync roots in temp folders against the in-process mock
+      # server). tests/real_panel.rs needs a running panel and skips itself
+      # when OTHCLOUD_REAL_PANEL isn't set.
+      - name: Test
+        run: cargo test
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Version
+        id: v
+        shell: pwsh
+        run: |
+          $v = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: othcloud-drive-${{ steps.v.outputs.version }}-${{ github.sha }}
+          path: target/release/othcloud-drive.exe
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/othcloud-drive.exe
+          generate_release_notes: true
