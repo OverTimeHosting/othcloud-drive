@@ -1,0 +1,63 @@
+[package]
+name = "othcloud-drive"
+version = "0.1.0"
+edition = "2021"
+description = "OTHCloud Drive: mounts OTHCloud drives as Windows drive letters (WinFsp) with two-way sync"
+license = "UNLICENSED"
+publish = false
+
+[lib]
+name = "othcloud_drive"
+path = "src/lib.rs"
+
+[[bin]]
+name = "othcloud-drive"
+path = "src/main.rs"
+
+[dependencies]
+winfsp = "0.13"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_SystemServices",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+parking_lot = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+url = "2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp", "ico"] }
+ico = "0.4"
+notify = "8"
+winreg = "0.55"
+tray-icon = "0.21"
+tao = "0.34"
+rfd = "0.15"
+anyhow = "1"
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync"] }
+tempfile = "3"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
