@@ -55,10 +55,10 @@ HTTP status: 400 bad input, 401 bad/missing token, 403 not allowed, 404 not foun
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `orgs` | `[{ id, name }]` orgs the user belongs to |
-| GET | `drives` | `[{ storageId, name, sizeBytes, quotaBytes, hasCover, coverFileId, color, updatedAt }]` — `color` is the drive accent ("#38bdf8") or null; `coverFileId` (or null) changes when the cover does |
+| GET | `drives` | `[{ storageId, name, sizeBytes, quotaBytes, hasCover, coverFileId, coverVersion, color, updatedAt }]` — `color` is the drive accent ("#38bdf8") or null; `coverFileId` (or null) changes when another cover is chosen; `coverVersion` (or null; newer panels) is the `cover` ETag's stamp `<fileId>-<updatedAt ms>-<size>`, so it also changes when the cover file's bytes are replaced |
 | POST | `drives` | JSON `{ name }` (1–80 chars) → 201 + a new, empty drive in the `drives` shape, owned by the caller. `GET drives` answers with the header `X-OTH-Drive-Manage: 1` on a panel that has this and the next row |
 | PUT | `drives?storageId=` | JSON `{ name }` → the renamed drive. (Deleting a drive is web-only) |
-| GET | `cover?storageId=` | the drive's cover image bytes (`Content-Type` image/*); 404 if none |
+| GET | `cover?storageId=[&w=]` | the drive's cover image bytes (`Content-Type` image/*), ETag'd (`If-None-Match` → 304); 404 `no_cover` if none. With `w` (newer panels): a JPEG/PNG at most `w` px on its longer side, made as `thumbnail` makes them — a cover is often HEIC, which clients can't decode; older panels ignore `w` |
 | GET | `tree?storageId=` | the WHOLE drive, flat (see below). Honors `If-None-Match` → 304 |
 | GET/HEAD | `file?fileId=` | file bytes. Honors `Range` (single `bytes=a-b` / `a-` / `-n`) → 206 + `Content-Range`; past the end → 416. Sends `ETag` (changes with the contents) and honors `If-None-Match` → 304 |
 | PUT | `file?storageId=&folderId=&name=` | create a NEW file from the raw body → 201. `folderId` omitted/empty = drive root. 409 `name_taken` if a file OR folder with that name exists in that folder |
@@ -170,12 +170,26 @@ filesystem is involved.
   (`0x80070194` "…exited unexpectedly" after a crash). Windows has no way to
   start an unpackaged provider for that (nor a packaged one: there is no
   activation for `FETCH_DATA`); see "Starting on demand" below.
-- **Drive icon** (letter + sync-root sidebar entry, the same .ico): the
-  cover (`GET cover`, revalidated with `If-None-Match` at most once a minute)
-  in a rounded tile with an OTHCloud badge; without a cover, a tile in the
-  drive's `color` (from `GET drives`; fallback brand navy) with the OTH logo.
-  A cover or colour change writes a NEW .ico file name (Explorer caches icons
-  by path), repoints both icons and deletes the old file.
+- **Drive icon** (letter + sync-root sidebar entry, the same .ico, sizes
+  16/20/24/32/40/48/64/256): a photo cover fills a rounded tile; a cover
+  with transparency (a logo) is trimmed and fitted inside a tile in the
+  drive's `color` (or a light neutral); an OTHCloud badge from 48 px up
+  only. Without a cover — or with one that can't be decoded — a tile in the
+  drive's `color` (fallback brand navy) with the OTH logo (64 px up) or a
+  globe mark.
+- **Live**: every ~15 s the engine reads `GET drives` (one small JSON) and
+  compares `coverFileId` / `coverVersion` / `color` / `name` with what it
+  last showed; only a change fetches the cover (`cover?w=512`,
+  `If-None-Match`; on an older panel that sends HEIC as is, `thumbnail` of
+  `coverFileId`; failing both, the colour tile). Without `coverVersion` (an
+  older panel) the cover is also revalidated every 10 min. A new look is a
+  NEW .ico file name (`<storageId>-<hash of style+cover+colour>.ico`:
+  Explorer caches icons by path); the letter's `DefaultIcon`/`DefaultLabel`
+  and the sync root (icon + display name: the navigation pane) are
+  repointed, Explorer gets one batched `SHCNE_UPDATEITEM` per path plus one
+  `SHCNE_ASSOCCHANGED`, and every other `.ico` of that drive is deleted. A
+  rename on the panel updates the labels the same way (the folder keeps its
+  name).
 - **Remote → local**: `tree` is polled every ~5 s with `If-None-Match`; the
   diff becomes placeholder create / update+dehydrate (content changed) /
   rename / delete (only files that are in sync; local unsynced edits win and

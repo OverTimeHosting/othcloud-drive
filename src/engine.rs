@@ -45,7 +45,8 @@ pub struct EngineOptions {
     pub rescan_interval: Duration,
     /// Sync root provider id (`cf::PROVIDER`; tests use `cf::TEST_PROVIDER`).
     pub provider: String,
-    /// How often to revalidate the drive's cover image (icon).
+    /// How often to re-check the drive's look on the panel (cover, colour,
+    /// name: one small `GET drives`; the cover itself only when it changed).
     pub cover_interval: Duration,
 }
 
@@ -62,7 +63,7 @@ impl Default for EngineOptions {
             host_name: crate::util::computer_name(),
             rescan_interval: Duration::from_secs(300),
             provider: cf::PROVIDER.to_string(),
-            cover_interval: Duration::from_secs(60),
+            cover_interval: Duration::from_secs(15),
         }
     }
 }
@@ -94,18 +95,45 @@ struct Shadow {
 /// The sync-root icon used when a drive has no cover.
 pub const DEFAULT_ICON: &str = r"%SystemRoot%\System32\imageres.dll,-1043";
 
-/// Where the drive's cover shows up, and what we last showed.
+/// Without `coverVersion` from the panel (older panels), how often the cover
+/// is revalidated (If-None-Match) in case its bytes were replaced in place.
+const COVER_REVALIDATE: Duration = Duration::from_secs(600);
+
+/// What a drive's icon is made from, as `GET drives` reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Look {
+    has_cover: bool,
+    cover_file_id: Option<String>,
+    cover_version: Option<String>,
+    color: Option<String>,
+}
+
+impl Look {
+    fn of(d: &crate::api::DriveInfo) -> Look {
+        Look {
+            has_cover: d.has_cover || d.cover_file_id.is_some(),
+            cover_file_id: d.cover_file_id.clone(),
+            cover_version: d.cover_version.clone(),
+            color: d.color.clone().filter(|c| !c.trim().is_empty()),
+        }
+    }
+}
+
+/// Where the drive's icon shows up, and what we last showed there.
 #[derive(Default)]
 struct IconState {
     letter: Option<char>,
     data_dir: Option<PathBuf>,
-    /// ETag of the cover the current .ico was made from.
-    etag: Option<String>,
     ico: Option<PathBuf>,
-    has_cover: bool,
-    /// Drive colour the current no-cover icon was drawn with.
-    color: Option<String>,
+    /// The look the current .ico was made from (None: not applied yet).
+    look: Option<Look>,
+    /// The name last given to Explorer (sync root + letter label).
+    label: Option<String>,
+    /// The (scaled) cover bytes behind the current icon and their ETag, so
+    /// a colour change re-renders without fetching the picture again.
+    cover: Option<(Vec<u8>, Option<String>)>,
     last_check: Option<Instant>,
+    last_cover_fetch: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -157,7 +185,7 @@ pub struct Engine {
     watcher: Mutex<Option<notify::RecommendedWatcher>>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     icons: Mutex<IconState>,
-    color: Mutex<Option<String>>,
+    look: Mutex<Look>,
 }
 
 fn file_sig(p: &Path) -> Option<(u64, Option<SystemTime>)> {
@@ -169,6 +197,39 @@ fn filetime_of(t: Option<SystemTime>) -> i64 {
     t.and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| crate::util::unix_ms_to_filetime(d.as_millis() as i64) as i64)
         .unwrap_or_else(|| now_filetime() as i64)
+}
+
+/// The .ico for a drive and the key of its file name: a hash of everything
+/// that shows (the drawing's style version, the cover bytes or "none", the
+/// colour), so a change of any of them is a new path for Explorer.
+fn render_drive_ico(cover: Option<&[u8]>, color: Option<&str>) -> Result<(Vec<u8>, u32), String> {
+    let mut h: u32 = 0x811c9dc5;
+    let mut feed = |b: &[u8]| {
+        for x in b {
+            h ^= *x as u32;
+            h = h.wrapping_mul(0x01000193);
+        }
+    };
+    feed(&crate::icons::STYLE.to_le_bytes());
+    feed(cover.unwrap_or(b"\0nocover"));
+    feed(b"\0");
+    feed(color.unwrap_or("").as_bytes());
+    Ok((crate::icons::drive_ico(cover, color)?, h))
+}
+
+/// Delete this drive's icon files other than `keep` (`<storageId>-*.ico`,
+/// and any `.ico.tmp` left by a crash). A file Explorer still holds open is
+/// left for the next pass.
+fn remove_other_icons(data_dir: &Path, storage_id: &str, keep: &Path) {
+    let prefix = format!("{storage_id}-");
+    let Ok(rd) = std::fs::read_dir(data_dir.join("icons")) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let n = e.file_name().to_string_lossy().to_string();
+        if p != keep && n.starts_with(&prefix) && (n.ends_with(".ico") || n.ends_with(".ico.tmp")) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 fn key(p: &Path) -> String {
@@ -225,7 +286,7 @@ impl Engine {
             watcher: Mutex::new(None),
             threads: Mutex::new(Vec::new()),
             icons: Mutex::new(IconState::default()),
-            color: Mutex::new(None),
+            look: Mutex::new(Look::default()),
         });
         let conn = cf::connect(&root, e.clone() as Arc<dyn cf::Callbacks>)
             .map_err(|er| format!("connecting sync root: {er}"))?;
@@ -457,17 +518,57 @@ impl Engine {
         }
     }
 
+    /// A folder between `local` and the sync root is pinned ("Always keep
+    /// on this device"), so `local` inherits it.
+    fn pinned_by_folder(&self, local: &Path) -> bool {
+        let mut p = local.parent();
+        while let Some(dir) = p {
+            if !dir.starts_with(&self.root) {
+                break;
+            }
+            if cf::attributes(dir).is_some_and(|a| a & cf::ATTR_PINNED != 0) {
+                return true;
+            }
+            if dir == self.root {
+                break;
+            }
+            p = dir.parent();
+        }
+        false
+    }
+
     /// Server content changed: new size/time, drop local bytes.
     fn update_from_remote(&self, rel: &str, local: &Path, pinned: bool) {
         let Some(id) = self.node_at(rel) else { return };
         let Some((meta, rid)) = self.meta_of(id) else { return };
+        let ident = cf::identity(false, &rid);
+        let mut was_pinned = pinned;
         let r = self.self_op(&[local], || {
-            cf::update_placeholder(local, &meta, &cf::identity(false, &rid), true)
+            match cf::update_placeholder(local, &meta, &ident, true) {
+                // Pinned ("Always keep on this device", itself or through its
+                // folder): Windows refuses to drop the old bytes, and retrying
+                // as before looped forever and kept the drive "syncing". So:
+                // clear the pin, update, put the pin back as it was, and fetch
+                // the new bytes below — a pinned file stays on the device.
+                Err(e) if cf::is_pinned_error(&e) => {
+                    was_pinned = true;
+                    cf::clear_pin(local)?;
+                    let r = cf::update_placeholder(local, &meta, &ident, true);
+                    if let Err(e) = cf::restore_pin(local, pinned) {
+                        tracing::warn!("restoring the pin on {}: {e}", local.display());
+                    }
+                    r
+                }
+                other => other,
+            }
         });
         match r {
             Ok(()) => {
                 self.st.lock().synced.insert(rid.clone(), (meta.size, meta.modified));
-                if pinned {
+                // Pinned itself, or through a folder above it: Windows lets the
+                // update drop the bytes in the inherited case, but "always keep
+                // on this device" still applies — fetch the new content now.
+                if was_pinned || self.pinned_by_folder(local) {
                     self.spawn_hydrate(local.to_path_buf());
                 }
             }
@@ -568,14 +669,21 @@ impl Engine {
     }
 
     pub fn refresh_volume(&self) {
-        if let Ok(drives) = self.net(self.api.drives()) {
-            if let Some(d) = drives.iter().find(|d| d.storage_id == self.storage_id) {
-                let total = d.quota_bytes.filter(|q| *q > 0).unwrap_or(0);
-                *self.volume.lock() = (total, total.saturating_sub(d.size_bytes));
-                *self.label.lock() = d.name.clone();
-                *self.color.lock() = d.color.clone();
-            }
-        }
+        let _ = self.fetch_drive_info();
+    }
+
+    /// `GET drives` → this drive's row; keeps size, name and look current.
+    fn fetch_drive_info(&self) -> Result<crate::api::DriveInfo, String> {
+        let drives = self.net(self.api.drives()).map_err(|e| e.to_string())?;
+        let d = drives
+            .into_iter()
+            .find(|d| d.storage_id == self.storage_id)
+            .ok_or_else(|| "the drive is no longer listed".to_string())?;
+        let total = d.quota_bytes.filter(|q| *q > 0).unwrap_or(0);
+        *self.volume.lock() = (total, total.saturating_sub(d.size_bytes));
+        *self.label.lock() = d.name.clone();
+        *self.look.lock() = Look::of(&d);
+        Ok(d)
     }
 
     // ---------------------------------------------------- local -> remote
@@ -727,100 +835,153 @@ impl Engine {
         }
     }
 
-    /// Current .ico (None = no cover).
+    /// The drive's current .ico (None until the first check made one).
     pub fn icon_path(&self) -> Option<PathBuf> {
         self.icons.lock().ico.clone()
     }
 
-    /// Revalidate the cover (If-None-Match) and the drive colour, and when
-    /// either changed re-render the icon under a NEW file name (Explorer
-    /// caches icons by path), point the letter's DefaultIcon and the sync
-    /// root's icon at it, and delete the old file. Ok(true) if it changed.
+    /// Re-check how the drive looks on the panel and bring Explorer in line.
+    ///
+    /// `GET drives` (one small JSON) says whether anything changed: the
+    /// cover's file id / `coverVersion`, the colour, the name. Only then is
+    /// the cover fetched (`cover?w=512`, If-None-Match; HEIC and other
+    /// formats the `image` crate can't read are scaled to JPEG/PNG by the
+    /// panel, with `thumbnail` as the fallback on an older panel), the icon
+    /// rendered under a NEW file name (Explorer caches icons by path), the
+    /// letter's DefaultIcon/DefaultLabel and the sync root (navigation pane
+    /// icon + name) repointed, the shell told, and every older .ico of this
+    /// drive deleted. A cover that can't be read at all gives the colour
+    /// tile — never a stale icon, and no re-download every pass.
+    /// Ok(true) if Explorer was told about a change.
     pub fn check_cover(&self) -> Result<bool, String> {
-        let (etag, old, had_cover, used_color, data_dir) = {
+        let data_dir = {
             let mut i = self.icons.lock();
             i.last_check = Some(Instant::now());
-            (i.etag.clone(), i.ico.clone(), i.has_cover, i.color.clone(), i.data_dir.clone())
+            i.data_dir.clone()
         };
         let Some(data_dir) = data_dir else { return Ok(false) };
-        self.refresh_volume();
-        let color = self.color.lock().clone();
-        let r = self
-            .net(self.api.cover_if(&self.storage_id, if had_cover { etag.as_deref() } else { None }))
-            .map_err(|e| e.to_string())?;
-        let fnv = |parts: &[&[u8]]| {
-            let mut h: u32 = 0x811c9dc5;
-            for p in parts {
-                for b in *p {
-                    h ^= *b as u32;
-                    h = h.wrapping_mul(0x01000193);
-                }
-            }
-            h
+        let d = self.fetch_drive_info()?;
+        let look = Look::of(&d);
+        let (prev_look, prev_ico, prev_label, cached, last_fetch) = {
+            let i = self.icons.lock();
+            (i.look.clone(), i.ico.clone(), i.label.clone(), i.cover.clone(), i.last_cover_fetch)
         };
-        let (ico_bytes, key, new_etag, has_cover) = match r {
-            // Same cover; the colour doesn't show on a cover icon.
-            crate::api::Cover::NotModified => return Ok(false),
-            crate::api::Cover::Image { bytes, etag: new_etag } => {
-                let tag = new_etag.clone().unwrap_or_default();
-                let key = fnv(&[b"cover", tag.as_bytes(), &bytes[..bytes.len().min(65536)]]);
-                (crate::icons::drive_ico(Some(&bytes), None)?, key, new_etag, true)
+        let ico_ok = prev_ico.as_ref().is_some_and(|p| p.exists());
+        let revalidate = look.has_cover
+            && look.cover_version.is_none()
+            && last_fetch.is_none_or(|t| t.elapsed() >= COVER_REVALIDATE);
+        let render = !ico_ok || prev_look.as_ref() != Some(&look) || revalidate;
+
+        let mut ico = prev_ico.clone().filter(|_| ico_ok);
+        if render {
+            let (bytes, how) = self.cover_picture(&look, prev_look.as_ref(), cached)?;
+            let (ico_bytes, key) = render_drive_ico(bytes.as_deref(), look.color.as_deref())?;
+            let path = data_dir.join("icons").join(format!("{}-{key:08x}.ico", self.storage_id));
+            if !path.exists() {
+                std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+                // Write-then-rename: Explorer must never read half a file.
+                let tmp = path.with_extension("ico.tmp");
+                std::fs::write(&tmp, ico_bytes).map_err(|e| e.to_string())?;
+                std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
             }
-            crate::api::Cover::None => {
-                if old.is_some() && !had_cover && used_color == color {
-                    return Ok(false);
-                }
-                let c = color.clone().unwrap_or_default();
-                let key = fnv(&[b"nocover", c.as_bytes()]);
-                (crate::icons::drive_ico(None, color.as_deref())?, key, None, false)
+            if ico.as_ref() != Some(&path) {
+                tracing::info!(
+                    "{}: drive icon -> {} ({how}, colour {})",
+                    d.name,
+                    path.display(),
+                    look.color.as_deref().unwrap_or("default")
+                );
             }
-        };
-        let path = data_dir.join("icons").join(format!("{}-{key:08x}.ico", self.storage_id));
-        if Some(&path) == old.as_ref() {
-            let mut i = self.icons.lock();
-            i.etag = new_etag;
-            i.has_cover = has_cover;
-            i.color = color;
-            return Ok(false);
+            ico = Some(path);
         }
-        std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-        std::fs::write(&path, ico_bytes).map_err(|e| e.to_string())?;
-        self.apply_icon(&path);
+        let ico_changed = ico != prev_ico || prev_look.is_none();
+        let label_changed = prev_label.as_deref() != Some(d.name.as_str());
         {
             let mut i = self.icons.lock();
-            i.etag = new_etag;
-            i.has_cover = has_cover;
-            i.color = color.clone();
-            i.ico = Some(path.clone());
+            i.look = Some(look);
+            i.ico = ico.clone();
         }
-        if let Some(o) = old {
-            let _ = std::fs::remove_file(&o);
+        if !ico_changed && !label_changed {
+            return Ok(false);
         }
-        tracing::info!(
-            "{}: drive icon -> {} ({})",
-            self.label(),
-            path.display(),
-            if has_cover { "cover".to_string() } else { format!("no cover, colour {}", color.as_deref().unwrap_or("default")) }
-        );
+        if let Some(ico) = &ico {
+            if label_changed && prev_label.is_some() {
+                tracing::info!("{}: renamed on the panel (was {:?})", d.name, prev_label.unwrap_or_default());
+            }
+            self.apply_icon(ico, &d.name);
+            self.icons.lock().label = Some(d.name.clone());
+            remove_other_icons(&data_dir, &self.storage_id, ico);
+        }
         Ok(true)
     }
 
-    fn apply_icon(&self, ico: &Path) {
-        let label = self.label();
+    /// The cover bytes to draw (None: draw the colour tile) and a word for
+    /// the log. Reuses `cached` on a 304.
+    fn cover_picture(
+        &self,
+        look: &Look,
+        prev: Option<&Look>,
+        cached: Option<(Vec<u8>, Option<String>)>,
+    ) -> Result<(Option<Vec<u8>>, &'static str), String> {
+        if !look.has_cover {
+            self.icons.lock().cover = None;
+            return Ok((None, "no cover"));
+        }
+        // Same picture as before: revalidate what we hold.
+        let same = prev.is_some_and(|p| p.has_cover && p.cover_file_id == look.cover_file_id);
+        let cached = cached.filter(|_| same);
+        let etag = cached.as_ref().and_then(|c| c.1.clone());
+        self.icons.lock().last_cover_fetch = Some(Instant::now());
+        let r = self
+            .net(self.api.cover_if(&self.storage_id, etag.as_deref(), Some(crate::icons::COVER_FETCH_WIDTH)))
+            .map_err(|e| format!("cover: {e}"))?;
+        let (bytes, etag) = match r {
+            crate::api::Cover::NotModified => match cached {
+                Some(c) => c,
+                None => return Ok((None, "no cover")),
+            },
+            crate::api::Cover::Image { bytes, etag } => (bytes, etag),
+            crate::api::Cover::None => {
+                self.icons.lock().cover = None;
+                return Ok((None, "no cover"));
+            }
+        };
+        let bytes = if crate::icons::decode_cover(&bytes).is_ok() {
+            Some(bytes)
+        } else {
+            // An older panel sends the original (HEIC, TIFF, ...): its
+            // thumbnail is a JPEG/PNG.
+            let thumb = look.cover_file_id.as_deref().and_then(|fid| {
+                self.net(self.api.thumbnail(fid, crate::icons::COVER_FETCH_WIDTH, Duration::from_secs(60)))
+                    .ok()
+                    .flatten()
+                    .filter(|b| crate::icons::decode_cover(b).is_ok())
+            });
+            if thumb.is_none() {
+                tracing::warn!("{}: the cover picture can't be read; showing the colour tile", self.label());
+            }
+            thumb
+        };
+        let how = if bytes.is_some() { "cover" } else { "unreadable cover" };
+        self.icons.lock().cover = bytes.clone().map(|b| (b, etag));
+        Ok((bytes, how))
+    }
+
+    fn apply_icon(&self, ico: &Path, label: &str) {
         let res = format!("{},0", ico.display());
         // Re-registering the same id updates the shell's sync root entry
-        // (navigation pane icon) in place.
+        // (navigation pane icon and name) in place.
         if let Err(e) = cf::register_sync_root(&cf::RootRegistration {
             id: &self.sync_root_id,
             path: &self.root,
-            display_name: &label,
+            display_name: label,
             icon: &res,
         }) {
             tracing::warn!("{label}: updating sync root icon: {e}");
         }
         let letter = self.icons.lock().letter;
         if let Some(l) = letter {
-            if let Err(e) = crate::platform::set_drive_icon(l, Some(ico), &label) {
+            if let Err(e) = crate::platform::set_drive_icon(l, Some(ico), label) {
                 tracing::warn!("drive icon for {l}: {e}");
             }
         }

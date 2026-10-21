@@ -234,14 +234,29 @@ pub fn unregister_url_scheme() {
 
 // ------------------------------------------------------------ drive icons
 
+/// Where per-letter label/icon keys live under HKCU. Tests point it
+/// elsewhere ([`set_drive_key_base`]) so they never dress up a real letter.
+static DRIVE_KEY_BASE: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
+
+const DRIVE_KEY_BASE_DEFAULT: &str = r"Software\Classes\Applications\Explorer.exe\Drives";
+
+/// Use `base` (under HKCU) instead of Explorer's per-user `Drives` key for
+/// the label/icon keys. For tests; None restores the real one.
+pub fn set_drive_key_base(base: Option<&str>) {
+    *DRIVE_KEY_BASE.write() = base.map(String::from);
+}
+
 fn drive_key_path(letter: char) -> String {
+    let base = DRIVE_KEY_BASE.read().clone();
     format!(
-        r"Software\Classes\Applications\Explorer.exe\Drives\{}",
+        r"{}\{}",
+        base.as_deref().unwrap_or(DRIVE_KEY_BASE_DEFAULT),
         letter.to_ascii_uppercase()
     )
 }
 
 /// Point Explorer's icon and label for `letter` at our .ico / name.
+/// Explorer is told (batched, see [`notify_shell`]).
 pub fn set_drive_icon(letter: char, ico: Option<&Path>, label: &str) -> std::io::Result<()> {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (k, _) = hkcu.create_subkey(drive_key_path(letter))?;
@@ -253,26 +268,17 @@ pub fn set_drive_icon(letter: char, ico: Option<&Path>, label: &str) -> std::io:
     }
     let (l, _) = k.create_subkey("DefaultLabel")?;
     l.set_value("", &label.to_string())?;
-    shell_refresh(letter);
+    notify_shell(&format!("{}:\\", letter.to_ascii_uppercase()));
     Ok(())
 }
 
-/// Tell Explorer a folder's (sync root's) look changed.
+/// Tell Explorer a folder's (sync root's) look changed (batched).
 pub fn shell_refresh_path(path: &Path) {
-    use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_PATHW};
-    let w: Vec<u16> = path
-        .display()
-        .to_string()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW, Some(w.as_ptr() as *const _), None);
-        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW, Some(w.as_ptr() as *const _), None);
-    }
+    notify_shell(&path.display().to_string());
 }
 
 /// Remove what `set_drive_icon` wrote (only if it carries our marker).
+/// Tells Explorer at once: this often runs just before the process exits.
 pub fn remove_drive_icon(letter: char) {
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let ours = hkcu
@@ -281,7 +287,8 @@ pub fn remove_drive_icon(letter: char) {
         .is_ok();
     if ours {
         let _ = hkcu.delete_subkey_all(drive_key_path(letter));
-        shell_refresh(letter);
+        notify_shell(&format!("{}:\\", letter.to_ascii_uppercase()));
+        flush_shell_notifications();
     }
 }
 
@@ -301,23 +308,70 @@ pub fn drive_icon_registration(letter: char) -> Option<(Option<String>, Option<S
     Some((icon, label))
 }
 
-fn shell_refresh(letter: char) {
-    use windows::Win32::UI::Shell::{
-        SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNE_UPDATEITEM, SHCNF_IDLIST, SHCNF_PATHW,
-    };
-    let path: Vec<u16> = format!("{letter}:\\")
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        SHChangeNotify(
-            SHCNE_UPDATEITEM,
-            SHCNF_PATHW,
-            Some(path.as_ptr() as *const _),
-            None,
-        );
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+// ------------------------------------------------- shell notifications
+//
+// Icon and label changes are batched: several drives changing in the same
+// poll (or one drive's letter + sync root) become one burst of
+// SHCNE_UPDATEITEM (one per path) and a single SHCNE_ASSOCCHANGED — the
+// event that makes Explorer drop its cached icons for drives and the
+// navigation pane. ASSOCCHANGED is expensive for the shell (every view
+// refreshes), so it must not go out once per drive.
+
+const SHELL_BATCH: std::time::Duration = std::time::Duration::from_millis(400);
+
+struct ShellQueue {
+    paths: Vec<String>,
+    worker: bool,
+}
+
+static SHELL_Q: parking_lot::Mutex<ShellQueue> = parking_lot::Mutex::new(ShellQueue { paths: Vec::new(), worker: false });
+
+/// Queue "the item at `path` changed its look". Sent within ~0.4 s, together
+/// with anything else queued meanwhile.
+pub fn notify_shell(path: &str) {
+    let mut q = SHELL_Q.lock();
+    if !q.paths.iter().any(|p| p.eq_ignore_ascii_case(path)) {
+        q.paths.push(path.to_string());
     }
+    if !q.worker {
+        q.worker = true;
+        let spawned = std::thread::Builder::new()
+            .name("shell-notify".into())
+            .spawn(|| {
+                std::thread::sleep(SHELL_BATCH);
+                SHELL_Q.lock().worker = false;
+                flush_shell_notifications();
+            })
+            .is_ok();
+        if !spawned {
+            q.worker = false;
+            drop(q);
+            flush_shell_notifications();
+        }
+    }
+}
+
+/// Send whatever is queued now (call before a short-lived process exits).
+pub fn flush_shell_notifications() {
+    use windows::Win32::UI::Shell::{
+        SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_FLUSHNOWAIT, SHCNF_IDLIST,
+        SHCNF_PATHW,
+    };
+    let paths = std::mem::take(&mut SHELL_Q.lock().paths);
+    if paths.is_empty() {
+        return;
+    }
+    tracing::debug!("shell: {} item(s) changed: {paths:?}", paths.len());
+    for p in &paths {
+        let w: Vec<u16> = p.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, Some(w.as_ptr() as *const _), None);
+            if !(p.len() == 3 && p.ends_with(":\\")) {
+                SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, Some(w.as_ptr() as *const _), None);
+            }
+        }
+    }
+    unsafe { SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, None, None) };
 }
 
 // ------------------------------------------------------------------ shell

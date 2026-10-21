@@ -114,6 +114,14 @@ pub struct DriveInfo {
     pub quota_bytes: Option<u64>,
     #[serde(default)]
     pub has_cover: bool,
+    /// The cover's file id (or null); changes when another picture is chosen.
+    #[serde(default)]
+    pub cover_file_id: Option<String>,
+    /// Changes whenever the cover's bytes can have (also on a replace that
+    /// keeps the file id). Newer panels only; without it the client
+    /// revalidates the cover itself now and then.
+    #[serde(default)]
+    pub cover_version: Option<String>,
     /// Accent colour ("#38bdf8") or null.
     #[serde(default)]
     pub color: Option<String>,
@@ -346,10 +354,16 @@ impl Api {
     }
 
     /// Revalidate the cover: `etag` is the one last seen (If-None-Match).
-    pub fn cover_if(&self, storage_id: &str, etag: Option<&str>) -> ApiResult<Cover> {
+    /// `w`: ask for a copy at most that many px on its longer side, as JPEG
+    /// or PNG (a panel without `w` ignores it and sends the original, which
+    /// may be HEIC).
+    pub fn cover_if(&self, storage_id: &str, etag: Option<&str>, w: Option<u32>) -> ApiResult<Cover> {
         let mut rb = self
             .req(&self.http, reqwest::Method::GET, "cover")
             .query(&[("storageId", storage_id)]);
+        if let Some(w) = w {
+            rb = rb.query(&[("w", w.to_string())]);
+        }
         if let Some(e) = etag.filter(|e| !e.is_empty()) {
             rb = rb.header("If-None-Match", e);
         }

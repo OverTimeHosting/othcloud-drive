@@ -120,12 +120,15 @@ OTHCloud in browser · Sign out · Open log folder · Quit.
 - **Offline.** Hydrated files stay readable; opening one that was never
   downloaded fails with "the network is unavailable". New and edited files
   are queued and uploaded with backoff when the server is reachable again.
-- **Drive icons.** The drive's cover (revalidated with `If-None-Match`
-  about once a minute) in a rounded tile with an OTHCloud badge; without a
-  cover, a tile in the drive's colour with the OTH logo. The same `.ico` is
-  used for the drive letter and the sync root's sidebar entry; a cover or
-  colour change writes a new file name (Explorer caches icons by path),
-  repoints both, deletes the old file and notifies the shell.
+- **Drive icons.** The drive's cover in a rounded tile (a logo with
+  transparency is fitted, not cropped; a badge from 48 px up); without a
+  readable cover, a tile in the drive's colour with the OTH logo. The same
+  `.ico` is used for the drive letter and the sync root's sidebar entry.
+  The drive's look and name are re-checked about every 15 s from `GET
+  drives`; a change writes a new file name (Explorer caches icons by path),
+  repoints both, updates the labels, deletes the old file and notifies the
+  shell. `cargo run --example render_icons -- <dir> [cover files…]` renders
+  a contact sheet for review.
 - **Pause sync** stops polling, uploads and remote deletes; opening files
   and renames/deletes still reach the server.
 

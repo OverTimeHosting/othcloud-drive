@@ -38,6 +38,10 @@ fn opts() -> EngineOptions {
 }
 
 fn start(server: MockServer, sid: String) -> Fx {
+    start_with(server, sid, opts())
+}
+
+fn start_with(server: MockServer, sid: String, opts: EngineOptions) -> Fx {
     let _ = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter(std::env::var("TEST_LOG").unwrap_or_else(|_| "othcloud_drive=info".into()))
@@ -46,7 +50,7 @@ fn start(server: MockServer, sid: String) -> Fx {
     let root = base.path().join("Drive");
     let paused = Arc::new(AtomicBool::new(false));
     let api = Api::new(&server.origin(), "test-token", Some("org_1".into()));
-    let engine = Engine::start(api, &sid, "Test", &root, "%SystemRoot%\\System32\\imageres.dll,-1043", paused.clone(), opts())
+    let engine = Engine::start(api, &sid, "Test", &root, "%SystemRoot%\\System32\\imageres.dll,-1043", paused.clone(), opts)
         .expect("engine start");
     let root = engine.root.clone();
     eprintln!("root policies: {:?}", cf::root_policies(&root));
@@ -327,6 +331,58 @@ fn remote_changes_are_applied() {
     assert!(!fx.e().refresh().unwrap(), "304");
 }
 
+/// Regression: a file pinned through its folder ("Always keep on this
+/// device") that changes on the server. Windows refuses to dehydrate pinned
+/// files, and the engine used to retry that forever — the drive stayed
+/// "syncing" (24k retries in a day on a real PC). Now the new content arrives,
+/// the file stays on the device and its pin state is unchanged.
+#[test]
+fn remote_change_to_a_pinned_file_is_applied_and_stays_local() {
+    let server = MockServer::start(0);
+    let sid = server.add_drive("Test", None);
+    server.put(&sid, "Kept/doc.txt", b"old");
+    let fx = start(server, sid.clone());
+    let dir = fx.p("Kept");
+    let file = fx.p("Kept\\doc.txt");
+    cf::set_pin(&dir, true).unwrap();
+    assert!(wait_until(15, || std::fs::read(&file).map(|b| b == b"old").unwrap_or(false) && !dehydrated(&file)));
+
+    fx.server.put(&sid, "Kept/doc.txt", b"new and longer");
+    assert!(fx.e().refresh().unwrap());
+    assert!(
+        wait_until(15, || !dehydrated(&file) && std::fs::read(&file).map(|b| b == b"new and longer").unwrap_or(false)),
+        "pinned file not updated and kept local: {:#x}",
+        attrs(&file)
+    );
+    assert!(attrs(&dir) & cf::ATTR_PINNED != 0, "folder still pinned");
+    assert!(attrs(&file) & cf::ATTR_UNPINNED == 0, "file not left unpinned");
+    // No retry loop: a second pass has nothing left to apply.
+    assert!(!fx.e().refresh().unwrap(), "304");
+}
+
+/// The same, for a file pinned itself (Windows answers the update with
+/// ERROR_CLOUD_FILE_PINNED): updated, kept local, and still pinned.
+#[test]
+fn remote_change_to_an_explicitly_pinned_file_keeps_its_pin() {
+    let server = MockServer::start(0);
+    let sid = server.add_drive("Test", None);
+    server.put(&sid, "own.txt", b"old");
+    let fx = start(server, sid.clone());
+    let file = fx.p("own.txt");
+    cf::set_pin(&file, true).unwrap();
+    assert!(wait_until(15, || !dehydrated(&file)));
+
+    fx.server.put(&sid, "own.txt", b"new and longer");
+    assert!(fx.e().refresh().unwrap());
+    assert!(
+        wait_until(15, || !dehydrated(&file) && std::fs::read(&file).map(|b| b == b"new and longer").unwrap_or(false)),
+        "explicitly pinned file not updated and kept local: {:#x}",
+        attrs(&file)
+    );
+    assert!(attrs(&file) & cf::ATTR_PINNED != 0, "pin restored");
+    assert!(!fx.e().refresh().unwrap(), "304");
+}
+
 #[test]
 fn pin_hydrates_and_unpin_frees_space() {
     let server = MockServer::start(0);
@@ -412,87 +468,237 @@ fn remove_local_moves_unsynced_files_aside_and_unregisters() {
     assert!(!cf::sync_roots(cf::TEST_PROVIDER).iter().any(|(i, _)| *i == id), "unregistered");
 }
 
-fn sync_root_icon(id: &str) -> Option<String> {
+fn sync_root_value(id: &str, name: &str) -> Option<String> {
     winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
         .open_subkey(format!(
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"
         ))
         .ok()?
-        .get_value("IconResource")
+        .get_value(name)
         .ok()
 }
 
+fn sync_root_icon(id: &str) -> Option<String> {
+    sync_root_value(id, "IconResource")
+}
+
+/// The drive-letter label/icon keys go to a scratch key under HKCU for the
+/// test binary (never Explorer's real `Drives\<L>`), deleted at the end.
+struct TestDriveKeys(String);
+
+impl TestDriveKeys {
+    fn new() -> Self {
+        let base = format!(r"Software\OTHCloudDriveTests\Drives-{}", std::process::id());
+        othcloud_drive::platform::set_drive_key_base(Some(&base));
+        TestDriveKeys(base)
+    }
+}
+
+impl Drop for TestDriveKeys {
+    fn drop(&mut self) {
+        let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        let _ = hkcu.delete_subkey_all(&self.0);
+        // The parent too, once no other test run is using it (fails if not empty).
+        let _ = hkcu.delete_subkey(r"Software\OTHCloudDriveTests");
+    }
+}
+
+fn png_of(rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(64, 48, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
+    out.into_inner()
+}
+
+/// The 64 px frame of an .ico (and every size is there).
+fn ico64(p: &Path) -> ico::IconImage {
+    let d = ico::IconDir::read(std::fs::File::open(p).unwrap()).unwrap();
+    let mut sizes: Vec<u32> = d.entries().iter().map(|e| e.width()).collect();
+    sizes.sort();
+    assert_eq!(sizes, vec![16, 20, 24, 32, 40, 48, 64, 256], "every size in {}", p.display());
+    d.entries().iter().find(|e| e.width() == 64).unwrap().decode().unwrap()
+}
+
+fn px(img: &ico::IconImage, x: u32, y: u32) -> [u8; 3] {
+    let i = ((y * img.width() + x) * 4) as usize;
+    [img.rgba_data()[i], img.rgba_data()[i + 1], img.rgba_data()[i + 2]]
+}
+
+/// This drive's .ico files in the icons folder.
+fn icon_files(dir: &Path, sid: &str) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir.join("icons"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    v.retain(|p| p.file_name().unwrap().to_string_lossy().starts_with(&format!("{sid}-")));
+    v
+}
+
+fn cover_requests(server: &MockServer) -> usize {
+    server.state.lock().unwrap().log.iter().filter(|(_, p, _)| p.ends_with("/cover")).count()
+}
+
+/// Cover, colour and name changes on the panel reach the letter's
+/// DefaultIcon/DefaultLabel and the sync root (navigation pane icon + name):
+/// each look is a NEW .ico path (Explorer caches by path), the old file is
+/// deleted, and a pass with nothing changed fetches no cover at all.
 #[test]
-fn drive_icon_follows_cover_and_colour() {
+fn drive_icon_follows_cover_colour_and_name() {
+    let keys = TestDriveKeys::new();
     let server = MockServer::start(0);
     let sid = server.add_drive("Test", None);
     let fx = start(server, sid.clone());
-    let icons = fx.base.path().join("data");
+    let data = fx.base.path().join("data");
     let set_cover = |bytes: &[u8]| {
-        fx.server.state.lock().unwrap().drive_mut(&sid).unwrap().cover =
-            (!bytes.is_empty()).then(|| bytes.to_vec());
+        fx.server.state.lock().unwrap().drive_mut(&sid).unwrap().cover = (!bytes.is_empty()).then(|| bytes.to_vec());
     };
     let set_color = |c: Option<&str>| {
         fx.server.state.lock().unwrap().drive_mut(&sid).unwrap().color = c.map(String::from);
     };
-    let png = |rgb: [u8; 3]| {
-        let img = image::RgbaImage::from_pixel(64, 48, image::Rgba([rgb[0], rgb[1], rgb[2], 255]));
-        let mut out = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(img).write_to(&mut out, image::ImageFormat::Png).unwrap();
-        out.into_inner()
-    };
-    let decode = |p: &Path| {
-        let d = ico::IconDir::read(std::fs::File::open(p).unwrap()).unwrap();
-        d.entries().iter().find(|e| e.width() == 64).unwrap().decode().unwrap()
-    };
-    let px = |img: &ico::IconImage, x: u32, y: u32| {
-        let i = ((y * img.width() + x) * 4) as usize;
-        [img.rgba_data()[i], img.rgba_data()[i + 1], img.rgba_data()[i + 2]]
+    // Letter Z, but only in the test key (TestDriveKeys).
+    let reg = || othcloud_drive::platform::drive_icon_registration('Z').unwrap();
+    let only = |p: &PathBuf| {
+        assert_eq!(icon_files(&data, &sid), vec![p.clone()], "exactly the current icon on disk");
+        assert_eq!(sync_root_icon(&fx.root_id).unwrap(), format!("{},0", p.display()));
+        assert_eq!(reg().0.as_deref(), Some(p.display().to_string().as_str()), "letter DefaultIcon");
     };
 
-    // No cover: branded default icon, registered for the sync root.
-    fx.e().attach_icons(None, &icons);
+    // No cover: branded default icon, registered for the letter and the sync root.
+    fx.e().attach_icons(Some('Z'), &data);
     let a = fx.e().icon_path().expect("default icon");
-    assert!(a.exists());
-    assert_eq!(sync_root_icon(&fx.root_id).unwrap(), format!("{},0", a.display()));
+    only(&a);
+    assert_eq!(reg().1.as_deref(), Some("Test"));
+    let n = cover_requests(&fx.server);
     assert!(!fx.e().check_cover().unwrap(), "nothing changed");
+    assert_eq!(cover_requests(&fx.server), n, "no cover fetched when nothing changed");
 
     // Colour change -> new file, old deleted, tile takes the colour.
     set_color(Some("#f43f5e"));
     assert!(fx.e().check_cover().unwrap());
     let b = fx.e().icon_path().unwrap();
     assert_ne!(a, b);
-    assert!(!a.exists(), "old icon deleted");
-    let top = px(&decode(&b), 32, 6);
+    only(&b);
+    let top = px(&ico64(&b), 32, 6);
     assert!(top[0] > 200 && top[1] < 140, "rose tile: {top:?}");
-    assert_eq!(sync_root_icon(&fx.root_id).unwrap(), format!("{},0", b.display()));
 
-    // Cover set -> cover icon (green shows through), sync root updated.
-    set_cover(&png([20, 200, 40]));
+    // Cover set -> cover icon (green shows through).
+    set_cover(&png_of([20, 200, 40]));
     assert!(fx.e().check_cover().unwrap());
     let c = fx.e().icon_path().unwrap();
-    assert!(!b.exists());
-    let p = px(&decode(&c), 20, 20);
+    only(&c);
+    let p = px(&ico64(&c), 20, 20);
     assert!(p[1] > 150 && p[0] < 80, "cover pixels: {p:?}");
-    assert_eq!(sync_root_icon(&fx.root_id).unwrap(), format!("{},0", c.display()));
-    // Unchanged -> 304, nothing rewritten.
+    // Unchanged -> nothing fetched, nothing rewritten.
+    let n = cover_requests(&fx.server);
     assert!(!fx.e().check_cover().unwrap());
     assert_eq!(fx.e().icon_path().unwrap(), c);
+    assert_eq!(cover_requests(&fx.server), n);
 
-    // New cover -> new file name (Explorer caches by path).
-    set_cover(&png([30, 60, 220]));
+    // New cover -> new file name.
+    set_cover(&png_of([30, 60, 220]));
     assert!(fx.e().check_cover().unwrap());
     let d = fx.e().icon_path().unwrap();
     assert_ne!(c, d);
-    assert!(!c.exists());
+    only(&d);
+
+    // Renamed on the panel: same icon, new label for the letter and the
+    // sync root (navigation pane).
+    fx.server.state.lock().unwrap().drive_mut(&sid).unwrap().name = "Renamed".into();
+    assert!(fx.e().check_cover().unwrap());
+    assert_eq!(fx.e().icon_path().unwrap(), d, "a rename keeps the icon");
+    assert_eq!(reg().1.as_deref(), Some("Renamed"));
+    assert_eq!(sync_root_value(&fx.root_id, "DisplayNameResource").as_deref(), Some("Renamed"));
+    only(&d);
 
     // Cover cleared -> back to the colour tile.
     set_cover(&[]);
     assert!(fx.e().check_cover().unwrap());
     let e = fx.e().icon_path().unwrap();
-    assert!(!d.exists());
-    let top = px(&decode(&e), 32, 6);
+    only(&e);
+    let top = px(&ico64(&e), 32, 6);
     assert!(top[0] > 200 && top[1] < 140, "rose tile again: {top:?}");
+
+    // A stale icon left by an earlier run is cleaned up on the next change.
+    let stray = data.join("icons").join(format!("{sid}-00000000.ico"));
+    std::fs::write(&stray, b"old").unwrap();
+    set_color(Some("#38bdf8"));
+    assert!(fx.e().check_cover().unwrap());
+    assert!(!stray.exists(), "stray icon deleted");
+    only(&fx.e().icon_path().unwrap());
+    drop(keys);
+}
+
+/// A cover the client can't decode (the real case: an iPhone HEIC). The
+/// panel's scaled copy (`cover?w=`) is used; without one (an older panel)
+/// the drive shows its colour tile — not the previous icon — and the
+/// undecodable picture is not downloaded again on every pass.
+#[test]
+fn undecodable_cover_uses_the_scaled_copy_or_the_colour_tile() {
+    let heic: &[u8] = b"\0\0\0\x18ftypheic\0\0\0\0mif1heicnot really an image";
+    let server = MockServer::start(0);
+    let sid = server.add_drive("Test", None);
+    let fx = start(server, sid.clone());
+    let data = fx.base.path().join("data");
+    {
+        let mut s = fx.server.state.lock().unwrap();
+        let d = s.drive_mut(&sid).unwrap();
+        d.color = Some("#f43f5e".into());
+        d.cover = Some(heic.to_vec());
+    }
+    fx.e().attach_icons(None, &data);
+    let a = fx.e().icon_path().expect("an icon despite the cover");
+    let top = px(&ico64(&a), 32, 6);
+    assert!(top[0] > 200 && top[1] < 140, "colour tile for an unreadable cover: {top:?}");
+    let n = cover_requests(&fx.server);
+    for _ in 0..3 {
+        assert!(!fx.e().check_cover().unwrap());
+    }
+    assert_eq!(cover_requests(&fx.server), n, "no re-download loop");
+
+    // The panel learns `cover?w=` (and the picture changes): the scaled
+    // copy shows.
+    {
+        let mut s = fx.server.state.lock().unwrap();
+        let d = s.drive_mut(&sid).unwrap();
+        d.cover = Some([heic, b"v2"].concat());
+        d.cover_scaled = Some(png_of([20, 200, 40]));
+    }
+    assert!(fx.e().check_cover().unwrap());
+    let b = fx.e().icon_path().unwrap();
+    assert_ne!(a, b);
+    assert!(!a.exists());
+    let p = px(&ico64(&b), 20, 20);
+    assert!(p[1] > 150 && p[0] < 80, "scaled cover shows: {p:?}");
+}
+
+/// The poll loop picks a change up by itself within the interval, and an
+/// older panel (no coverFileId/coverVersion in `drives`) still works.
+#[test]
+fn poll_loop_applies_changes_without_a_restart() {
+    let server = MockServer::start(0);
+    server.state.lock().unwrap().legacy_drives = true;
+    let sid = server.add_drive("Test", None);
+    let mut o = opts();
+    o.poll_interval = Duration::from_millis(300);
+    o.cover_interval = Duration::from_secs(1);
+    let fx = start_with(server, sid.clone(), o);
+    let data = fx.base.path().join("data");
+    fx.e().attach_icons(None, &data);
+    let a = fx.e().icon_path().unwrap();
+    fx.server.state.lock().unwrap().drive_mut(&sid).unwrap().cover = Some(png_of([20, 200, 40]));
+    let t = Instant::now();
+    // The new path is published before the sync root is repointed and the
+    // old file removed, so wait for the whole change, not just the path.
+    let applied = || {
+        let Some(p) = fx.e().icon_path().filter(|p| *p != a) else { return false };
+        sync_root_icon(&fx.root_id).is_some_and(|i| i == format!("{},0", p.display())) && icon_files(&data, &sid) == vec![p]
+    };
+    assert!(wait_until(10, applied), "cover picked up by the poll loop");
+    eprintln!("cover change applied after {:?}", t.elapsed());
+    let b = fx.e().icon_path().unwrap();
+    let p = px(&ico64(&b), 20, 20);
+    assert!(p[1] > 150 && p[0] < 80, "cover pixels: {p:?}");
+    assert_eq!(sync_root_icon(&fx.root_id).unwrap(), format!("{},0", b.display()));
+    assert_eq!(icon_files(&data, &sid), vec![b]);
 }
 
 /// The Explorer thumbnail path (thumbs.rs): a cloud placeholder's picture

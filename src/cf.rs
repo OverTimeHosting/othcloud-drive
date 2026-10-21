@@ -830,6 +830,27 @@ pub fn dehydrate(path: &Path) -> CfResult<()> {
     unsafe { CfDehydratePlaceholder(h.raw(), 0, -1, CF_DEHYDRATE_FLAG_NONE, None) }
 }
 
+/// ERROR_CLOUD_FILE_PINNED: Windows won't dehydrate a pinned file ("Always keep
+/// on this device") — including one pinned only through its folder.
+pub fn is_pinned_error(e: &windows::core::Error) -> bool {
+    e.code().0 as u32 == 0x8007_0188
+}
+
+/// Clear a file's own pin state so it can be dehydrated (see
+/// [`restore_pin`]). Changes nothing on the folder it inherits from.
+pub fn clear_pin(path: &Path) -> CfResult<()> {
+    let h = open_cf(path, CF_OPEN_FILE_FLAG_NONE)?;
+    unsafe { CfSetPinState(h.raw(), CF_PIN_STATE_UNSPECIFIED, CF_SET_PIN_FLAG_NONE, None) }
+}
+
+/// Put a pin state back after [`clear_pin`]: pinned itself, or following its
+/// folder again.
+pub fn restore_pin(path: &Path, explicitly_pinned: bool) -> CfResult<()> {
+    let h = open_cf(path, CF_OPEN_FILE_FLAG_NONE)?;
+    let st = if explicitly_pinned { CF_PIN_STATE_PINNED } else { CF_PIN_STATE_INHERIT };
+    unsafe { CfSetPinState(h.raw(), st, CF_SET_PIN_FLAG_NONE, None) }
+}
+
 pub fn set_pin(path: &Path, pinned: bool) -> CfResult<()> {
     let h = open_cf(path, CF_OPEN_FILE_FLAG_NONE)?;
     let st = if pinned { CF_PIN_STATE_PINNED } else { CF_PIN_STATE_UNPINNED };

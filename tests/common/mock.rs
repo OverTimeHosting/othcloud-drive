@@ -45,6 +45,10 @@ pub struct MDrive {
     pub name: String,
     pub quota: Option<u64>,
     pub cover: Option<Vec<u8>>,
+    /// What `cover?w=` answers with (the panel's scaled JPEG/PNG of a
+    /// cover it can read but a client may not, e.g. HEIC). None: `w` is
+    /// ignored and the original is sent, as by an older panel.
+    pub cover_scaled: Option<Vec<u8>>,
     pub color: Option<String>,
     pub folders: HashMap<String, MFolder>,
     pub files: HashMap<String, MFile>,
@@ -159,6 +163,8 @@ pub struct MockState {
     pub fail_all: bool,
     /// Omit ids from write responses (to exercise the client's fallback).
     pub terse: bool,
+    /// Answer `GET drives` as an older panel: no coverFileId / coverVersion.
+    pub legacy_drives: bool,
     /// Per-server id prefix, so parallel servers never share ids.
     pub tag: String,
     /// The folder-backup API (`/api/desktop/backup/*`).
@@ -331,6 +337,7 @@ impl MockServer {
             name: name.into(),
             quota,
             cover: None,
+            cover_scaled: None,
             color: None,
             folders: HashMap::new(),
             files: HashMap::new(),
@@ -567,17 +574,26 @@ async fn handler(
                 .iter()
                 .filter(|d| d.org == org)
                 .map(|d| {
-                    json!({
+                    let mut v = json!({
                         "storageId": d.storage_id, "name": d.name, "sizeBytes": d.used(),
                         "quotaBytes": d.quota, "hasCover": d.cover.is_some(), "color": d.color, "updatedAt": now_iso()
-                    })
+                    });
+                    if !s.legacy_drives {
+                        // A new picture is a new file id; coverVersion follows the bytes.
+                        let h = d.cover.as_ref().map(|c| hex(&Sha256::digest(c))[..16].to_string());
+                        v["coverFileId"] = json!(h.as_ref().map(|h| format!("file_cover_{h}")));
+                        v["coverVersion"] = json!(h);
+                    }
+                    v
                 })
                 .collect();
             axum::Json(Value::Array(v)).into_response()
         }
         ("GET", "cover") => {
             let i = drive!(q.get("storageId").cloned().unwrap_or_default());
-            match &s.drives[i].cover {
+            let d = &s.drives[i];
+            let scaled = if q.contains_key("w") { d.cover_scaled.as_ref().filter(|_| d.cover.is_some()) } else { None };
+            match scaled.or(d.cover.as_ref()) {
                 Some(c) => {
                     let etag = format!("\"c{}\"", &hex(&Sha256::digest(c))[..16]);
                     let inm = headers.get("if-none-match").and_then(|v| v.to_str().ok());

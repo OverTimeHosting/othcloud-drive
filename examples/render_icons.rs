@@ -1,9 +1,11 @@
 //! Render sample drive icons (every size) and a contact sheet, for review.
 //!
-//!   cargo run --example render_icons -- <out dir>
+//!   cargo run --example render_icons -- <out dir> [cover image file ...]
+//!
+//! Extra arguments are real cover images (PNG/JPEG/WebP...), one row each.
 
 use image::{imageops, DynamicImage, Rgba, RgbaImage};
-use othcloud_drive::icons::{render, SmallBadge, SIZES};
+use othcloud_drive::icons::{decode_cover, prepare_cover, render, SIZES};
 
 fn photo() -> DynamicImage {
     // Photo-like: sky gradient, sun, two hills, some noise.
@@ -50,30 +52,36 @@ fn wide() -> DynamicImage {
 }
 
 fn main() {
-    let out = std::path::PathBuf::from(std::env::args().nth(1).expect("out dir"));
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let out = std::path::PathBuf::from(args.first().expect("out dir"));
     std::fs::create_dir_all(&out).unwrap();
-    let covers = [("cover-photo", photo()), ("cover-white", white()), ("cover-wide", wide())];
-    let colors: [(&str, Option<[u8; 3]>); 3] = [
+    let mut covers: Vec<(String, DynamicImage)> =
+        vec![("cover-photo".into(), photo()), ("cover-white".into(), white()), ("cover-wide".into(), wide())];
+    for f in &args[1..] {
+        let p = std::path::Path::new(f);
+        let name = format!("file-{}", p.file_stem().unwrap().to_string_lossy());
+        match decode_cover(&std::fs::read(p).unwrap()) {
+            Ok(img) => covers.push((name, img)),
+            Err(e) => eprintln!("{f}: {e}"),
+        }
+    }
+    let colors: [(&str, Option<[u8; 3]>); 4] = [
         ("nocover-null", None),
         ("nocover-38bdf8", othcloud_drive::icons::parse_color("#38bdf8")),
         ("nocover-f43f5e", othcloud_drive::icons::parse_color("#f43f5e")),
+        ("nocover-facc15", othcloud_drive::icons::parse_color("#facc15")),
     ];
-    // (name, cover, color, small badge)
     let mut rows: Vec<(String, Vec<RgbaImage>)> = Vec::new();
     for (name, c) in &covers {
-        for sb in [SmallBadge::Dot, SmallBadge::None] {
-            let label = format!("{name}{}", if sb == SmallBadge::None { "-16nobadge" } else { "" });
-            let imgs: Vec<RgbaImage> = SIZES.iter().map(|s| render(*s, Some(c), None, sb)).collect();
-            if sb == SmallBadge::Dot {
-                for (s, img) in SIZES.iter().zip(&imgs) {
-                    img.save(out.join(format!("{name}-{s}.png"))).unwrap();
-                }
-            }
-            rows.push((label, imgs));
+        let prepared = prepare_cover(c);
+        let imgs: Vec<RgbaImage> = SIZES.iter().map(|s| render(*s, Some(&prepared), None)).collect();
+        for (s, img) in SIZES.iter().zip(&imgs) {
+            img.save(out.join(format!("{name}-{s}.png"))).unwrap();
         }
+        rows.push((name.clone(), imgs));
     }
     for (name, col) in &colors {
-        let imgs: Vec<RgbaImage> = SIZES.iter().map(|s| render(*s, None, *col, SmallBadge::Dot)).collect();
+        let imgs: Vec<RgbaImage> = SIZES.iter().map(|s| render(*s, None, *col)).collect();
         for (s, img) in SIZES.iter().zip(&imgs) {
             img.save(out.join(format!("{name}-{s}.png"))).unwrap();
         }
@@ -82,7 +90,7 @@ fn main() {
     // Contact sheet: per row, 1x on white | 1x on dark | 4x zoom (small sizes).
     let pad = 8u32;
     let one_w: u32 = SIZES.iter().map(|s| s + pad).sum();
-    let zoom_sizes = [64u32, 48, 32, 24, 16];
+    let zoom_sizes = [64u32, 48, 32, 24, 20, 16];
     let zoom_w: u32 = zoom_sizes.iter().map(|s| s * 4 + pad).sum();
     let row_h = 256 + pad;
     let w = one_w * 2 + zoom_w + pad * 4;

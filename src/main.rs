@@ -105,7 +105,7 @@ fn headless_mount(args: &[String]) -> i32 {
     let no_letter = args.iter().any(|a| a == "--no-letter");
     let remove = args.iter().any(|a| a == "--remove-on-exit");
     let provider = arg_value(args, "--provider-id").unwrap_or_else(|| othcloud_drive::cf::PROVIDER.to_string());
-    let cover_secs = arg_value(args, "--cover-secs").and_then(|s| s.parse().ok()).unwrap_or(60u64);
+    let cover_secs = arg_value(args, "--cover-secs").and_then(|s| s.parse().ok()).unwrap_or(15u64);
     let poll = arg_value(args, "--poll-secs")
         .and_then(|s| s.parse().ok())
         .unwrap_or(15u64);

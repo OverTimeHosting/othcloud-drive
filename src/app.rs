@@ -101,7 +101,12 @@ pub fn mount_drive(
     paused: Arc<AtomicBool>,
     opts: EngineOptions,
 ) -> Result<Mounted, String> {
-    let engine = Engine::start(api, &d.storage_id, &d.name, root, crate::engine::DEFAULT_ICON, paused, opts)?;
+    // Register with the icon this drive already has, if any, so Explorer
+    // doesn't flash the generic icon until the first check (attach_icons).
+    let icon = newest_icon(data_dir, &d.storage_id)
+        .map(|p| format!("{},0", p.display()))
+        .unwrap_or_else(|| crate::engine::DEFAULT_ICON.to_string());
+    let engine = Engine::start(api, &d.storage_id, &d.name, root, &icon, paused, opts)?;
     let mut m = Mounted {
         root: engine.root.clone(),
         engine,
@@ -912,7 +917,10 @@ pub enum LetterRestore {
 /// — this is the whole of the Companion's `--letters` launch.
 pub fn restore_letters(cfg_dir: &Path, data_dir: &Path) -> Vec<LetterRestore> {
     let cfg = Config::load(cfg_dir);
-    restore_letters_from(&cfg, &crate::cf::our_sync_roots(), crate::cf::PROVIDER, data_dir)
+    let r = restore_letters_from(&cfg, &crate::cf::our_sync_roots(), crate::cf::PROVIDER, data_dir);
+    // `--letters` exits right after this: send the batched shell events now.
+    platform::flush_shell_notifications();
+    r
 }
 
 pub fn restore_letters_from(
