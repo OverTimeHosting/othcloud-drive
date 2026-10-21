@@ -161,6 +161,29 @@ pub struct MockState {
     pub terse: bool,
     /// Per-server id prefix, so parallel servers never share ids.
     pub tag: String,
+    /// The folder-backup API (`/api/desktop/backup/*`).
+    pub backup: MockBackup,
+}
+
+/// PROTOCOL.md "Folder backup", in memory.
+#[derive(Debug, Default)]
+pub struct MockBackup {
+    /// Answer 404 for every backup route (a panel without the feature).
+    pub disabled: bool,
+    /// (deviceKey, deviceId, body of the last PUT device)
+    pub devices: Vec<(String, String, Value)>,
+    /// deviceId -> the profile as returned
+    pub profiles: HashMap<String, Value>,
+    /// Every PUT profile body.
+    pub profile_puts: Vec<Value>,
+    /// Every POST status body.
+    pub statuses: Vec<Value>,
+    /// fileId -> deleted on the PC?
+    pub deleted: HashMap<String, bool>,
+    /// Every POST deleted body.
+    pub deleted_posts: Vec<Value>,
+    /// fileId -> previous contents kept by `X-OTH-Keep-Version: 1` (newest last, 5 kept).
+    pub versions: HashMap<String, Vec<Vec<u8>>>,
 }
 
 impl MockState {
@@ -350,6 +373,16 @@ impl MockServer {
         out
     }
 
+    /// Server-side delete of the folder at `path` and everything in it.
+    pub fn rmdir(&self, sid: &str, path: &str) -> bool {
+        let mut s = self.state.lock().unwrap();
+        let Some(d) = s.drive_mut(sid) else { return false };
+        let Some(Some(id)) = d.folder_by_path(path) else { return false };
+        d.remove_folder_recursive(&id);
+        d.touch();
+        true
+    }
+
     pub fn requests(&self, method: &str, path_contains: &str) -> usize {
         self.state
             .lock()
@@ -457,6 +490,11 @@ async fn handler(
             .into_response(),
             None => error(StatusCode::BAD_REQUEST, "invalid_code", "unknown code"),
         };
+    }
+
+    if let Some(bep) = path.strip_prefix("/api/desktop/backup/") {
+        s.log.push((method.to_string(), path.clone(), None));
+        return backup_api(&mut s, bep, &method, &q, &headers, body);
     }
 
     let Some(ep) = path.strip_prefix("/api/desktop/drive/") else {
@@ -571,6 +609,23 @@ async fn handler(
             });
             ([("etag", etag)], axum::Json(body)).into_response()
         }
+        // A "thumbnail" is "thumb:<w>:<first bytes of the file>" for files
+        // named *.jpg / *.png; anything else is 415, like the panel.
+        ("GET", "thumbnail") => {
+            let id = q.get("fileId").cloned().unwrap_or_default();
+            let Some(i) = find_file(&s, &id) else {
+                return error(StatusCode::NOT_FOUND, "not_found", "no such file");
+            };
+            let f = &s.drives[i].files[&id];
+            let w = q.get("w").cloned().unwrap_or_default();
+            let lower = f.name.to_lowercase();
+            if !(lower.ends_with(".jpg") || lower.ends_with(".png")) {
+                return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_an_image", "no thumbnail");
+            }
+            let mut body = format!("thumb:{w}:").into_bytes();
+            body.extend_from_slice(&f.data[..f.data.len().min(8)]);
+            ([("content-type", "image/jpeg")], body).into_response()
+        }
         ("GET", "file") => {
             let id = q.get("fileId").cloned().unwrap_or_default();
             let Some(i) = find_file(&s, &id) else {
@@ -621,7 +676,12 @@ async fn handler(
                 let Some(i) = find_file(&s, &fid) else {
                     return error(StatusCode::NOT_FOUND, "not_found", "no such file");
                 };
-                let d = &mut s.drives[i];
+                let keep = headers.get("x-oth-keep-version").and_then(|v| v.to_str().ok()) == Some("1");
+                if keep && !under_backup_folder(&s, i, &fid) {
+                    return error(StatusCode::FORBIDDEN, "not_backup_file", "not under a backup folder");
+                }
+                let st: &mut MockState = &mut s;
+                let d = &mut st.drives[i];
                 let old = d.files[&fid].data.len() as u64;
                 if let Some(qb) = d.quota {
                     if d.used() - old + content_length > qb {
@@ -629,6 +689,14 @@ async fn handler(
                     }
                 }
                 let f = d.files.get_mut(&fid).unwrap();
+                if keep {
+                    let old = f.data.clone();
+                    let v = st.backup.versions.entry(fid.clone()).or_default();
+                    v.push(old);
+                    if v.len() > 5 {
+                        v.remove(0);
+                    }
+                }
                 f.data = body.to_vec();
                 f.updated_at = now_iso();
                 let out = file_json(f);
@@ -897,4 +965,133 @@ fn mock_admin(
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Is file `fid` (in drive `i`) under a backup folder of any profile?
+fn under_backup_folder(s: &MockState, i: usize, fid: &str) -> bool {
+    let d = &s.drives[i];
+    let roots: Vec<String> = s
+        .backup
+        .profiles
+        .values()
+        .filter(|p| p["storageId"].as_str() == Some(d.storage_id.as_str()))
+        .flat_map(|p| p["folders"].as_array().cloned().unwrap_or_default())
+        .filter_map(|f| f["remoteFolderId"].as_str().map(String::from))
+        .collect();
+    let mut cur = d.files.get(fid).and_then(|f| f.folder.clone());
+    let mut guard = 0;
+    while let Some(c) = cur {
+        if roots.contains(&c) {
+            return true;
+        }
+        cur = d.folders.get(&c).and_then(|f| f.parent.clone());
+        guard += 1;
+        if guard > 256 {
+            break;
+        }
+    }
+    false
+}
+
+/// `/api/desktop/backup/*` (PROTOCOL.md "Folder backup").
+fn backup_api(
+    s: &mut MockState,
+    ep: &str,
+    method: &Method,
+    q: &HashMap<String, String>,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Response {
+    if s.backup.disabled {
+        return error(StatusCode::NOT_FOUND, "not_found", "no such route");
+    }
+    let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if auth != format!("Bearer {}", s.token) {
+        return error(StatusCode::UNAUTHORIZED, "unauthorized", "bad token");
+    }
+    let org = match headers.get("x-oth-org").and_then(|v| v.to_str().ok()) {
+        Some(o) => o.to_string(),
+        None => return error(StatusCode::BAD_REQUEST, "missing_org", "X-OTH-Org required"),
+    };
+    if !s.orgs.iter().any(|(id, _)| *id == org) {
+        return error(StatusCode::FORBIDDEN, "not_member", "not a member");
+    }
+    let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    match (method.as_str(), ep) {
+        ("PUT", "device") => {
+            let key = v["deviceKey"].as_str().unwrap_or("").to_string();
+            if key.is_empty() || v["name"].as_str().unwrap_or("").is_empty() || v["platform"] != "windows" {
+                return error(StatusCode::BAD_REQUEST, "bad_request", "device");
+            }
+            let existing = s.backup.devices.iter().position(|(k, _, _)| *k == key);
+            let id = match existing {
+                Some(i) => {
+                    s.backup.devices[i].2 = v.clone();
+                    s.backup.devices[i].1.clone()
+                }
+                None => {
+                    let id = s.next_id("dev");
+                    s.backup.devices.push((key, id.clone(), v.clone()));
+                    id
+                }
+            };
+            axum::Json(json!({ "deviceId": id })).into_response()
+        }
+        ("GET", "profile") => {
+            let dev = q.get("deviceId").cloned().unwrap_or_default();
+            let p = s.backup.profiles.get(&dev).cloned().unwrap_or(Value::Null);
+            axum::Json(json!({ "profile": p })).into_response()
+        }
+        ("PUT", "profile") => {
+            let dev = v["deviceId"].as_str().unwrap_or("").to_string();
+            let Some(name) = s.backup.devices.iter().find(|d| d.1 == dev).and_then(|d| d.2["name"].as_str().map(String::from)) else {
+                return error(StatusCode::NOT_FOUND, "not_found", "device");
+            };
+            let sid = v["storageId"].as_str().unwrap_or("").to_string();
+            if !s.drives.iter().any(|d| d.storage_id == sid && d.org == org) {
+                return error(StatusCode::NOT_FOUND, "not_found", "drive");
+            }
+            s.backup.profile_puts.push(v.clone());
+            let mut folders = Vec::new();
+            for f in v["folders"].as_array().cloned().unwrap_or_default() {
+                let path = if f["kind"] == "photos" {
+                    format!("Photo backup/{name}")
+                } else {
+                    format!("Backups/{name}/{}", f["label"].as_str().unwrap_or(""))
+                };
+                let sent = f["remoteFolderId"].as_str().map(String::from).filter(|id| {
+                    f["kind"] == "photos" && s.drive(&sid).is_some_and(|d| d.folders.contains_key(id))
+                });
+                let id = match sent {
+                    Some(id) => Some(id),
+                    None => mkdirs_locked(s, &sid, &path),
+                };
+                let mut f = f.clone();
+                f["remoteFolderId"] = json!(id);
+                f["status"] = Value::Null;
+                folders.push(f);
+            }
+            let p = json!({
+                "profileId": format!("prof_{dev}"), "deviceId": dev, "storageId": sid,
+                "paused": v["paused"], "folders": folders, "updatedAt": now_iso(),
+            });
+            s.backup.profiles.insert(dev, p.clone());
+            axum::Json(json!({ "profile": p })).into_response()
+        }
+        ("POST", "status") => {
+            s.backup.statuses.push(v);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        ("POST", "deleted") => {
+            let deleted = v["deleted"].as_bool().unwrap_or(false);
+            for id in v["fileIds"].as_array().cloned().unwrap_or_default() {
+                if let Some(id) = id.as_str() {
+                    s.backup.deleted.insert(id.to_string(), deleted);
+                }
+            }
+            s.backup.deleted_posts.push(v);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        _ => error(StatusCode::NOT_FOUND, "not_found", "no such route"),
+    }
 }

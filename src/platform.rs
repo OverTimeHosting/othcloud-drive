@@ -79,6 +79,86 @@ pub fn pictures_dir() -> Option<PathBuf> {
     known_folder(&windows::Win32::UI::Shell::FOLDERID_Pictures)
 }
 
+/// The user's Desktop, Documents, Pictures and Downloads (Known Folders —
+/// wherever they were moved, e.g. into OneDrive): (id, label, path).
+pub fn backup_known_folders() -> Vec<(&'static str, &'static str, PathBuf)> {
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures};
+    [
+        ("desktop", "Desktop", FOLDERID_Desktop),
+        ("documents", "Documents", FOLDERID_Documents),
+        ("pictures", "Pictures", FOLDERID_Pictures),
+        ("downloads", "Downloads", FOLDERID_Downloads),
+    ]
+    .into_iter()
+    .filter_map(|(id, label, guid)| known_folder(&guid).map(|p| (id, label, p)))
+    .collect()
+}
+
+/// Folders a backup must never be inside of: Windows, the program folders,
+/// ProgramData and the user's AppData.
+pub fn system_dirs() -> Vec<PathBuf> {
+    use windows::Win32::UI::Shell::{
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86,
+        FOLDERID_RoamingAppData, FOLDERID_Windows,
+    };
+    let mut out: Vec<PathBuf> = [
+        FOLDERID_Windows,
+        FOLDERID_ProgramFiles,
+        FOLDERID_ProgramFilesX86,
+        FOLDERID_ProgramData,
+        FOLDERID_RoamingAppData,
+        FOLDERID_LocalAppData,
+    ]
+    .iter()
+    .filter_map(known_folder)
+    .collect();
+    // %USERPROFILE%\AppData itself (LocalLow and the rest).
+    if let Some(local) = known_folder(&FOLDERID_LocalAppData) {
+        if let Some(p) = local.parent() {
+            out.push(p.to_path_buf());
+        }
+    }
+    for v in ["SystemRoot", "ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+        if let Ok(p) = std::env::var(v) {
+            out.push(PathBuf::from(p));
+        }
+    }
+    out
+}
+
+/// "Windows 11 (10.0.26200)" — Windows 11 still calls itself 10.0, the
+/// build tells them apart.
+pub fn os_version() -> String {
+    let key = winreg::RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let build: u32 = key
+        .as_ref()
+        .ok()
+        .and_then(|k| k.get_value::<String, _>("CurrentBuild").ok())
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(0);
+    let name = if build >= 22000 { "Windows 11" } else { "Windows 10" };
+    format!("{name} (10.0.{build})")
+}
+
+/// `n` random bytes as hex, from the system RNG.
+pub fn random_hex(n: usize) -> String {
+    use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
+    let mut buf = vec![0u8; n];
+    let ok = unsafe { BCryptGenRandom(None, &mut buf, BCRYPT_USE_SYSTEM_PREFERRED_RNG) }.is_ok();
+    if !ok {
+        // Never expected; still unique enough for an install/folder id.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = (t >> ((i % 16) * 8)) as u8 ^ (std::process::id() as u8).wrapping_mul(i as u8 + 1);
+        }
+    }
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// %APPDATA%\OTHCloud Drive (settings, DPAPI-protected token).
 pub fn config_dir() -> PathBuf {
     if let Ok(d) = std::env::var("OTHCLOUD_DRIVE_CONFIG_DIR") {

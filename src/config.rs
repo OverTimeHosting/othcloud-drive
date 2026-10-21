@@ -16,20 +16,112 @@ pub fn default_origin() -> String {
         .unwrap_or_else(|| DEFAULT_ORIGIN.to_string())
 }
 
+/// What a backed-up folder holds: everything, or pictures only (the old
+/// photo backup, which became one of these folders).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderKind {
+    #[default]
+    Folder,
+    Photos,
+}
+
+impl FolderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FolderKind::Folder => "folder",
+            FolderKind::Photos => "photos",
+        }
+    }
+}
+
+/// One local folder backed up into the backup drive (PROTOCOL.md "Folder
+/// backup").
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct BackupSettings {
+pub struct BackupFolder {
+    /// Random, made once when the folder is added; the panel keys the
+    /// folder's remote folder and status by it. The migrated photo backup
+    /// is "photos".
+    pub folder_key: String,
+    pub label: String,
+    pub local_path: PathBuf,
+    #[serde(default)]
+    pub kind: FolderKind,
     #[serde(default)]
     pub enabled: bool,
-    /// Local folder to watch; None = the user's Pictures.
+    /// Glob patterns (see `backup::Excludes`).
     #[serde(default)]
-    pub folder: Option<PathBuf>,
-    /// Drive to upload into; None = the first drive.
-    #[serde(default)]
-    pub storage_id: Option<String>,
-    /// Remote folder path ("a/b"); None = "Photo backup/<PC name>".
+    pub excludes: Vec<String>,
+    /// Remote folder path override ("a/b"). Only the migrated photo backup
+    /// has one, when it had a custom remote folder.
     #[serde(default)]
     pub remote_folder: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BackupSettings {
+    /// LEGACY photo backup on/off. Read once by the migration into
+    /// `folders`; afterwards kept in step with the `photos` folder so that
+    /// an older build reading this file behaves the same.
+    #[serde(default)]
+    pub enabled: bool,
+    /// LEGACY: local folder to watch; None = the user's Pictures.
+    #[serde(default)]
+    pub folder: Option<PathBuf>,
+    /// The ONE drive every backed-up folder goes into; None = the first drive.
+    #[serde(default)]
+    pub storage_id: Option<String>,
+    /// LEGACY: remote folder path ("a/b"); None = "Photo backup/<PC name>".
+    #[serde(default)]
+    pub remote_folder: Option<String>,
+    /// Random id of this install, made once and kept (`PUT device`).
+    #[serde(default)]
+    pub device_key: Option<String>,
+    #[serde(default)]
+    pub folders: Vec<BackupFolder>,
+    /// Backup alone is paused (the app-wide pause stops it too).
+    #[serde(default)]
+    pub paused: bool,
+    /// The legacy photo backup has been turned into a `photos` folder.
+    #[serde(default)]
+    pub migrated: bool,
+}
+
+impl BackupSettings {
+    /// Turn the legacy photo backup into a `photos` folder, once. Its
+    /// remote folder and upload state (`backup-<storageId>.json`, see
+    /// `backup::state_path`) stay what they were, so nothing is uploaded
+    /// twice. `pictures` is the user's Pictures folder (the legacy default).
+    /// Returns whether anything changed.
+    pub fn migrate(&mut self, pictures: Option<PathBuf>) -> bool {
+        if self.migrated {
+            return false;
+        }
+        self.migrated = true;
+        let used = self.enabled || self.folder.is_some() || self.remote_folder.is_some();
+        if used && !self.folders.iter().any(|f| f.kind == FolderKind::Photos) {
+            if let Some(path) = self.folder.clone().or(pictures) {
+                self.folders.push(BackupFolder {
+                    folder_key: PHOTOS_KEY.into(),
+                    label: "Photos".into(),
+                    local_path: path,
+                    kind: FolderKind::Photos,
+                    enabled: self.enabled,
+                    excludes: Vec::new(),
+                    remote_folder: self.remote_folder.clone(),
+                });
+            }
+        }
+        true
+    }
+
+    pub fn folder(&self, key: &str) -> Option<&BackupFolder> {
+        self.folders.iter().find(|f| f.folder_key == key)
+    }
+}
+
+/// The folder key of the migrated photo backup.
+pub const PHOTOS_KEY: &str = "photos";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
@@ -44,6 +136,16 @@ pub struct Config {
     /// storageId -> its sync root folder (chosen once, then kept).
     #[serde(default)]
     pub roots: HashMap<String, PathBuf>,
+    /// storageId -> preferred drive letter (absent = first free from O:).
+    #[serde(default)]
+    pub letters: HashMap<String, char>,
+    /// storageId -> the letter it is mapped to now (chosen or automatic).
+    /// Kept when the app quits — the letter itself stays for the rest of the
+    /// logon session — so it can be put back at the next sign-in before the
+    /// app runs (`app::restore_letters`; the Companion's `--letters`).
+    /// Cleared when a drive is removed from this PC and on sign-out.
+    #[serde(default)]
+    pub mapped: HashMap<String, char>,
     #[serde(default)]
     pub paused: bool,
     #[serde(default)]
@@ -180,6 +282,8 @@ mod tests {
         assert!(c.wants_mounted("s"));
         c.drives.insert("s".into(), false);
         c.backup.enabled = true;
+        c.letters.insert("s".into(), 'P');
+        c.mapped.insert("s".into(), 'P');
         c.save(dir.path()).unwrap();
         let c2 = Config::load(dir.path());
         assert_eq!(c, c2);
@@ -197,6 +301,42 @@ mod tests {
         assert_eq!(load_credentials(dir.path()).unwrap(), cr);
         delete_credentials(dir.path());
         assert!(load_credentials(dir.path()).is_none());
+    }
+
+    #[test]
+    fn photo_backup_migrates_once_into_a_photos_folder() {
+        // A config written by the photo-backup-only build.
+        let old = r#"{"origin":"https://x","backup":{"enabled":true,"folder":null,"storage_id":"stor_1","remote_folder":null}}"#;
+        let mut c: Config = serde_json::from_str(old).unwrap();
+        assert!(!c.backup.migrated && c.backup.folders.is_empty());
+        assert!(c.backup.migrate(Some(PathBuf::from(r"C:\Users\me\Pictures"))));
+        let f = &c.backup.folders[0];
+        assert_eq!(f.folder_key, PHOTOS_KEY);
+        assert_eq!(f.kind, FolderKind::Photos);
+        assert!(f.enabled);
+        assert_eq!(f.local_path, PathBuf::from(r"C:\Users\me\Pictures"));
+        assert_eq!(f.remote_folder, None);
+        assert_eq!(c.backup.storage_id.as_deref(), Some("stor_1"));
+        // Once only; nothing duplicated.
+        assert!(!c.backup.migrate(Some(PathBuf::from("x"))));
+        assert_eq!(c.backup.folders.len(), 1);
+        // Custom folder + remote folder carry over; off stays off.
+        let mut b = BackupSettings {
+            folder: Some(PathBuf::from(r"D:\Camera")),
+            remote_folder: Some("Phone/Camera".into()),
+            ..Default::default()
+        };
+        b.migrate(None);
+        assert_eq!(b.folders[0].local_path, PathBuf::from(r"D:\Camera"));
+        assert_eq!(b.folders[0].remote_folder.as_deref(), Some("Phone/Camera"));
+        assert!(!b.folders[0].enabled);
+        // Never used: nothing added.
+        let mut n = BackupSettings::default();
+        n.migrate(Some(PathBuf::from("p")));
+        assert!(n.folders.is_empty() && n.migrated);
+        // And the new fields survive a round trip.
+        let back: Config = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
     }
 
     #[test]

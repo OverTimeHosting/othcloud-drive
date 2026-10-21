@@ -52,7 +52,11 @@ pub struct EngineOptions {
 impl Default for EngineOptions {
     fn default() -> Self {
         EngineOptions {
-            poll_interval: Duration::from_secs(15),
+            // A tree poll that answers 304 is a few small queries on the
+            // panel (driveTreeEtag hashes the rows in the database; nothing
+            // is transferred) and ~25 ms here, so remote changes can show
+            // up within ~5 s rather than ~15 s.
+            poll_interval: Duration::from_secs(5),
             settle: Duration::from_millis(1500),
             delete_grace: Duration::from_secs(4),
             host_name: crate::util::computer_name(),
@@ -226,6 +230,12 @@ impl Engine {
         let conn = cf::connect(&root, e.clone() as Arc<dyn cf::Callbacks>)
             .map_err(|er| format!("connecting sync root: {er}"))?;
         *e.conn.lock() = Some(conn);
+        // Explorer's thumbnails for placeholders (when the embedding app
+        // registered a handler; see thumbs.rs).
+        crate::thumbs::add_root(&root, e.api.clone());
+        if e.opts.provider == cf::PROVIDER && cf::thumbnail_provider().is_some() {
+            crate::thumbs::ensure_serving();
+        }
 
         // First tree before anything else (offline start is tolerated).
         if let Err(er) = e.refresh() {
@@ -1391,6 +1401,7 @@ impl Engine {
             let _ = t.join();
         }
         self.conn.lock().take();
+        crate::thumbs::remove_root(&self.root);
         tracing::info!("{}: disconnected", self.label());
     }
 

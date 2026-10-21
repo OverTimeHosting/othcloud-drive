@@ -119,7 +119,7 @@ fn build_menu(a: &App) -> Menu {
             "backup:toggle",
             "Back up new photos",
             !a.drives.is_empty(),
-            a.cfg.backup.enabled,
+            a.photo_backup_enabled(),
             None,
         ));
         let folder = a
@@ -152,12 +152,11 @@ fn build_menu(a: &App) -> Menu {
         let _ = pb.append(&dsub);
         if let Some(b) = &a.backup {
             let st = b.status.lock();
-            let line = match (&st.last_error, &st.last) {
+            let photos = st.folders.get(crate::config::PHOTOS_KEY);
+            let err = st.last_error.clone().or_else(|| photos.and_then(|f| f.last_error.clone()));
+            let line = match (err, photos) {
                 (Some(e), _) => format!("Last error: {}", e.chars().take(60).collect::<String>()),
-                (None, Some(r)) => format!(
-                    "{} backed up ({} new last pass)",
-                    st.total_backed_up, r.uploaded
-                ),
+                (None, Some(f)) => format!("{} backed up ({} this session)", f.files, f.uploaded),
                 _ => "Scanning…".into(),
             };
             let _ = pb.append(&MenuItem::with_id("backup:status", line, false, None));
@@ -350,7 +349,7 @@ pub fn run(app: Shared, initial_link: Option<String>) {
                         platform::open_in_explorer(&d.display().to_string());
                     }
                     "backup:toggle" => {
-                        let on = !app.lock().cfg.backup.enabled;
+                        let on = !app.lock().photo_backup_enabled();
                         work(&app, &proxy, move |a| {
                             a.set_backup_enabled(on);
                             Ok(())

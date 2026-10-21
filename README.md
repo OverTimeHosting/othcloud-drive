@@ -96,7 +96,7 @@ OTHCloud in browser · Sign out · Open log folder · Quit.
   (≤ 4 MiB per request). The placeholder file *is* the cache.
   **Free up space** / **Always keep on this device** in Explorer
   (`attrib +U` / `attrib +P`) dehydrate / hydrate files.
-- **Remote changes** (polled every ~15 s with `If-None-Match`): new items
+- **Remote changes** (polled every ~5 s with `If-None-Match`): new items
   become placeholders; changed files are updated and dehydrated (re-fetched
   on next open); renames/moves and deletes are applied locally. A file with
   local changes that aren't uploaded yet is never overwritten or deleted.

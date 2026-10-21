@@ -1,14 +1,49 @@
 //! Drive letters as `subst`-style aliases of a sync root folder
-//! (DefineDosDeviceW in the user's logon session). They don't survive
-//! logoff, so the app re-creates them on every start and removes them on
-//! quit/unmount.
+//! (DefineDosDeviceW in the user's logon session). A definition belongs to
+//! the logon session, not to the process that made it: it stays after the
+//! app quits (or is killed) and goes at logoff. So the app leaves letters in
+//! place when it quits, removes one only when its drive leaves this PC (or
+//! moves to another letter), and puts them back at the next sign-in with
+//! [`crate::app::restore_letters`] — run by the app at start and, in
+//! OTHCloud Companion, by a tiny `--letters` launch at logon.
 
 use std::path::{Path, PathBuf};
 use windows::core::HSTRING;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows::Win32::Storage::FileSystem::{
     DefineDosDeviceW, QueryDosDeviceW, DDD_EXACT_MATCH_ON_REMOVE, DDD_REMOVE_DEFINITION,
     DEFINE_DOS_DEVICE_FLAGS,
 };
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
+
+/// Serialises letter changes between processes of this user (the app, and
+/// the logon `--letters` helper that may run beside it): DefineDosDevice
+/// STACKS a second definition of a letter, so two processes mapping the same
+/// letter at once would leave one behind after an unmap.
+struct LetterLock(HANDLE);
+
+impl Drop for LetterLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+fn lock() -> Option<LetterLock> {
+    let name = HSTRING::from(format!(r"Local\OTHCloudDriveLetters-{}", crate::cf::user_sid()));
+    unsafe {
+        let h = CreateMutexW(None, false, &name).ok()?;
+        let w = WaitForSingleObject(h, 5000);
+        if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
+            Some(LetterLock(h))
+        } else {
+            let _ = CloseHandle(h);
+            None
+        }
+    }
+}
 
 fn dev(letter: char) -> HSTRING {
     HSTRING::from(format!("{}:", letter.to_ascii_uppercase()))
@@ -42,6 +77,7 @@ pub fn points_to(letter: char, path: &Path) -> bool {
 
 /// Map `letter` to `path` (like `subst L: path`).
 pub fn map(letter: char, path: &Path) -> Result<(), String> {
+    let _g = lock();
     if points_to(letter, path) {
         return Ok(());
     }
@@ -62,6 +98,7 @@ pub fn map(letter: char, path: &Path) -> Result<(), String> {
 
 /// Remove the alias (only if it still points at `path`).
 pub fn unmap(letter: char, path: &Path) {
+    let _g = lock();
     let Some(t) = target(letter) else { return };
     if norm(&t) != norm(&path.display().to_string()) {
         return;

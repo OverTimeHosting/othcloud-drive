@@ -183,12 +183,106 @@ pub fn register_sync_root(r: &RootRegistration) -> CfResult<()> {
             BinaryStringEncoding::Utf8,
         )?)?;
         StorageProviderSyncRootManager::Register(&info)
-    })
+    })?;
+    // (Re-)registering rewrites the shell's key, so the handler goes back on
+    // every time.
+    apply_thumbnail_provider(r.id);
+    Ok(())
 }
 
 pub fn unregister_sync_root(id: &str) -> CfResult<()> {
+    set_root_value(id, THUMBNAIL_VALUE, None);
+    set_root_value(id, STATUS_VALUE, None);
     let id = HSTRING::from(id);
     on_mta(move || windows::Storage::Provider::StorageProviderSyncRootManager::Unregister(&id))
+}
+
+// ---------------------------------------------------- thumbnail handler
+
+/// The registry value under a sync root's `SyncRootManager\<id>` key that
+/// names the COM class Explorer asks for thumbnails of placeholders (what a
+/// packaged provider declares as `desktop3:ThumbnailProviderHandler`). Without
+/// one, the shell answers WTS_E_NOSTORAGEPROVIDERTHUMBNAILHANDLER for every
+/// file that isn't downloaded, and Explorer shows only icons.
+const THUMBNAIL_VALUE: &str = "ThumbnailProvider";
+
+static THUMBNAIL_CLSID: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
+
+/// The thumbnail handler (a COM CLSID, `{…}`) to put on every sync root this
+/// process registers, or None for none. The embedding app sets it once it has
+/// registered the class (OTHCloud Companion ships the handler DLL; the
+/// standalone app has none). Applied to roots registered from now on; see
+/// [`apply_thumbnail_provider_to_all`] for the ones already there.
+pub fn set_thumbnail_provider(clsid: Option<String>) {
+    *THUMBNAIL_CLSID.write() = clsid;
+}
+
+pub fn thumbnail_provider() -> Option<String> {
+    THUMBNAIL_CLSID.read().clone()
+}
+
+/// The value naming the class Explorer asks for the provider's status when
+/// the user opens the sync root (Windows 11's cloud-provider status; what a
+/// packaged provider declares as `StorageProviderStatusUISourceFactory`).
+/// The Companion's class also starts the app if it isn't running.
+const STATUS_VALUE: &str = "StorageProviderStatusUISourceFactory";
+
+static STATUS_CLSID: parking_lot::RwLock<Option<String>> = parking_lot::RwLock::new(None);
+
+/// Like [`set_thumbnail_provider`], for the status class.
+pub fn set_status_provider(clsid: Option<String>) {
+    *STATUS_CLSID.write() = clsid;
+}
+
+/// Write (or remove) the shell handlers on one registered root.
+pub fn apply_thumbnail_provider(id: &str) {
+    let clsid = thumbnail_provider();
+    set_root_value(id, THUMBNAIL_VALUE, clsid.as_deref());
+    let status = STATUS_CLSID.read().clone();
+    set_root_value(id, STATUS_VALUE, status.as_deref());
+}
+
+/// Bring every sync root of `provider` in line with the current handler.
+pub fn apply_thumbnail_provider_to_all(provider: &str) {
+    for (id, _) in sync_roots(provider) {
+        apply_thumbnail_provider(&id);
+    }
+}
+
+/// The shell's key for a root is under HKLM, but `BUILTIN\Users` may set
+/// values in it (that is how the platform's own registration works for an
+/// unelevated provider).
+fn set_root_value(id: &str, name: &str, value: Option<&str>) {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE};
+    let path = format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}");
+    let Ok(k) = winreg::RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(&path, KEY_SET_VALUE | KEY_QUERY_VALUE)
+    else {
+        return;
+    };
+    let r = match value {
+        Some(v) => {
+            if k.get_value::<String, _>(name).ok().as_deref() == Some(v) {
+                return;
+            }
+            k.set_value(name, &v.to_string())
+        }
+        None => match k.delete_value(name) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            r => r,
+        },
+    };
+    if let Err(e) = r {
+        tracing::warn!("{id}: setting {name}: {e}");
+    }
+}
+
+/// The handler named on a registered root (tests, diagnostics).
+pub fn root_thumbnail_provider(id: &str) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    winreg::RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SyncRootManager\{id}"))
+        .and_then(|k| k.get_value::<String, _>(THUMBNAIL_VALUE))
+        .ok()
 }
 
 /// Path of a registered sync root, if registered.
@@ -809,7 +903,15 @@ mod tests {
         for (id, p) in &ids {
             assert!(listed.iter().any(|(i, lp)| i == id && lp == p), "{id} listed");
             assert_eq!(sync_root_path(id).as_deref(), Some(p.as_path()));
+            // No handler configured in this process: none written.
+            assert_eq!(root_thumbnail_provider(id), None);
         }
+        // The handler value goes on (and comes off) without elevation.
+        let clsid = "{00000000-1111-2222-3333-444444444444}";
+        set_root_value(&ids[0].0, THUMBNAIL_VALUE, Some(clsid));
+        assert_eq!(root_thumbnail_provider(&ids[0].0).as_deref(), Some(clsid));
+        set_root_value(&ids[0].0, THUMBNAIL_VALUE, None);
+        assert_eq!(root_thumbnail_provider(&ids[0].0), None);
         assert!(!our_sync_roots().iter().any(|(i, _)| ids.iter().any(|(t, _)| t == i)), "test roots never show as the app's");
         for (id, _) in &ids {
             unregister_sync_root(id).unwrap();

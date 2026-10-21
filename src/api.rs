@@ -437,6 +437,31 @@ impl Api {
         }
     }
 
+    /// `GET thumbnail?fileId=&w=` — a small JPEG/PNG of a picture, at most
+    /// `w` px on its longer side (the panel snaps `w` up to a size it keeps).
+    /// `Ok(None)` when the panel has no thumbnail for it (415: not a
+    /// picture it can read; 413: too large). Bounded by `timeout` and by
+    /// [`MAX_THUMBNAIL_BYTES`], because Explorer is waiting on it.
+    pub fn thumbnail(&self, file_id: &str, w: u32, timeout: Duration) -> ApiResult<Option<Vec<u8>>> {
+        let rb = self
+            .req(&self.http, reqwest::Method::GET, "thumbnail")
+            .query(&[("fileId", file_id), ("w", &w.to_string())])
+            .timeout(timeout);
+        let resp = match Self::send(rb) {
+            Ok(r) => r,
+            Err(e) if matches!(e.status(), Some(413) | Some(415)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let mut body = Vec::new();
+        resp.take(MAX_THUMBNAIL_BYTES as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+        if body.len() > MAX_THUMBNAIL_BYTES {
+            return Err(ApiError::Decode("thumbnail larger than the limit".into()));
+        }
+        Ok(Some(body))
+    }
+
     /// Download the entire file into `out`.
     pub fn download(&self, file_id: &str, out: &mut dyn std::io::Write) -> ApiResult<u64> {
         let rb = self
@@ -496,6 +521,76 @@ impl Api {
             .header("Content-Length", len)
             .body(body);
         Self::parse_file_row(Self::send(rb)?)
+    }
+
+    /// PUT file?fileId= with `X-OTH-Keep-Version: 1`: the panel keeps the
+    /// current contents as a version before replacing them (backup folders
+    /// only; 403 elsewhere — PROTOCOL.md "Folder backup").
+    pub fn upload_replace_keep_version(&self, file_id: &str, path: &Path) -> ApiResult<PartialFile> {
+        let (body, len) = Self::upload_body(path)?;
+        let rb = self
+            .req(&self.http_long, reqwest::Method::PUT, "file")
+            .query(&[("fileId", file_id)])
+            .header("Content-Type", "application/octet-stream")
+            .header("Content-Length", len)
+            .header("X-OTH-Keep-Version", "1")
+            .body(body);
+        Self::parse_file_row(Self::send(rb)?)
+    }
+
+    // ------------------------------------------------- folder backup API
+
+    fn backup_req(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
+        let mut r = self
+            .http
+            .request(method, format!("{}/api/desktop/backup/{}", self.origin, path))
+            .bearer_auth(&self.token);
+        if let Some(org) = &self.org {
+            r = r.header("X-OTH-Org", org);
+        }
+        r
+    }
+
+    /// `PUT device` → the device's id (same `deviceKey` = same device).
+    pub fn backup_device(&self, d: &DeviceRequest) -> ApiResult<String> {
+        let v: serde_json::Value = Self::json(Self::send(self.backup_req(reqwest::Method::PUT, "device").json(d))?)?;
+        let v = v.get("device").cloned().unwrap_or(v);
+        v.get("deviceId")
+            .and_then(|x| x.as_str())
+            .map(String::from)
+            .ok_or_else(|| ApiError::Decode("no deviceId".into()))
+    }
+
+    /// `GET profile?deviceId=` → the saved profile, if any.
+    pub fn backup_profile(&self, device_id: &str) -> ApiResult<Option<Profile>> {
+        let rb = self
+            .backup_req(reqwest::Method::GET, "profile")
+            .query(&[("deviceId", device_id)]);
+        let v: serde_json::Value = Self::json(Self::send(rb)?)?;
+        match v.get("profile") {
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(p) => serde_json::from_value(p.clone()).map(Some).map_err(|e| ApiError::Decode(e.to_string())),
+        }
+    }
+
+    /// `PUT profile` → the profile with each folder's `remoteFolderId`.
+    pub fn backup_put_profile(&self, p: &ProfileRequest) -> ApiResult<Profile> {
+        let v: serde_json::Value = Self::json(Self::send(self.backup_req(reqwest::Method::PUT, "profile").json(p))?)?;
+        let row = v.get("profile").cloned().unwrap_or(v);
+        serde_json::from_value(row).map_err(|e| ApiError::Decode(e.to_string()))
+    }
+
+    /// `POST status` (204).
+    pub fn backup_status(&self, s: &StatusRequest) -> ApiResult<()> {
+        Self::send(self.backup_req(reqwest::Method::POST, "status").json(s)).map(|_| ())
+    }
+
+    /// `POST deleted` (204): mark / unmark files *deleted on this PC*.
+    pub fn backup_deleted(&self, device_id: &str, file_ids: &[String], deleted: bool) -> ApiResult<()> {
+        let rb = self.backup_req(reqwest::Method::POST, "deleted").json(&serde_json::json!({
+            "deviceId": device_id, "fileIds": file_ids, "deleted": deleted,
+        }));
+        Self::send(rb).map(|_| ())
     }
 
     /// Same as `upload_new` but from memory (used by the photo backup tests
@@ -570,6 +665,86 @@ impl Api {
         }
     }
 }
+
+/// `PUT device` body.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRequest {
+    pub device_key: String,
+    pub name: String,
+    pub platform: String,
+    pub os_version: String,
+    pub app_version: String,
+}
+
+/// A folder as the app sends it in `PUT profile`.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileFolderRequest {
+    pub folder_key: String,
+    pub label: String,
+    pub local_path: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub excludes: Vec<String>,
+    /// `photos` only: the folder the photo backup already uploads to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileRequest {
+    pub device_id: String,
+    pub storage_id: String,
+    pub paused: bool,
+    pub folders: Vec<ProfileFolderRequest>,
+}
+
+/// A folder of a profile as the panel returns it (only what the app uses).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileFolder {
+    pub folder_key: String,
+    #[serde(default)]
+    pub remote_folder_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct Profile {
+    #[serde(default)]
+    pub profile_id: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub storage_id: Option<String>,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub folders: Vec<ProfileFolder>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderStatusReport {
+    pub folder_key: String,
+    pub files: u64,
+    pub bytes: u64,
+    pub pending: u64,
+    pub last_backup_at: Option<String>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct StatusRequest {
+    pub device_id: String,
+    pub folders: Vec<FolderStatusReport>,
+}
+
+/// The most a `thumbnail` response may be (a 1024 px JPEG is ~200 KB).
+pub const MAX_THUMBNAIL_BYTES: usize = 4 * 1024 * 1024;
 
 /// Result of revalidating a drive's cover image.
 #[derive(Debug, Clone, PartialEq, Eq)]

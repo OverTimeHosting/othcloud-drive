@@ -12,5 +12,7 @@ pub mod ipc;
 pub mod letters;
 pub mod ns;
 pub mod platform;
+pub mod shellstatus;
+pub mod thumbs;
 pub mod tray;
 pub mod util;

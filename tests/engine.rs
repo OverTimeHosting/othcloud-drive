@@ -494,3 +494,54 @@ fn drive_icon_follows_cover_and_colour() {
     let top = px(&decode(&e), 32, 6);
     assert!(top[0] > 200 && top[1] < 140, "rose tile again: {top:?}");
 }
+
+/// The Explorer thumbnail path (thumbs.rs): a cloud placeholder's picture
+/// comes from the panel's `thumbnail` endpoint by its file id, without the
+/// placeholder being downloaded; paths that aren't ours, non-pictures and
+/// files with local changes get no picture. Answers are cached by contents.
+#[test]
+fn thumbnails_for_placeholders_without_hydrating() {
+    use othcloud_drive::ipc::ThumbStatus;
+    use othcloud_drive::thumbs;
+    let server = MockServer::start(0);
+    let sid = server.add_drive("Test", None);
+    server.put(&sid, "Photos/a.jpg", &pattern(300_000, 3));
+    server.put(&sid, "Photos/clip.mp4", b"not a picture");
+    let fx = start(server, sid);
+    let a = fx.p("Photos").join("a.jpg");
+    assert!(dehydrated(&a));
+
+    let t = thumbs::thumbnail(&a, 200).expect("a thumbnail");
+    let mut want = b"thumb:256:".to_vec();
+    want.extend_from_slice(&pattern(300_000, 3)[..8]);
+    assert_eq!(t, want, "asked by id, size snapped up to 256");
+    assert!(dehydrated(&a), "still a cloud file");
+    assert_eq!(fx.server.requests("GET", "/file"), 0, "no download");
+    assert_eq!(fx.server.requests("GET", "/thumbnail"), 1);
+
+    // Cached (same contents): no second request.
+    assert_eq!(thumbs::thumbnail(&a, 256).unwrap(), want);
+    assert_eq!(fx.server.requests("GET", "/thumbnail"), 1);
+
+    // Not a picture: answered here, no request.
+    assert_eq!(thumbs::thumbnail(&fx.p("Photos").join("clip.mp4"), 256), Err(ThumbStatus::NoThumbnail));
+    assert_eq!(fx.server.requests("GET", "/thumbnail"), 1);
+    // Outside every sync root, or a folder.
+    let outside = fx.base.path().join("x.jpg");
+    std::fs::write(&outside, b"x").unwrap();
+    assert_eq!(thumbs::thumbnail(&outside, 256), Err(ThumbStatus::NotOurs));
+    assert_eq!(thumbs::thumbnail(&fx.p("Photos"), 256), Err(ThumbStatus::NoThumbnail));
+
+    // Changed here: the panel's picture would be stale, so none until it
+    // is uploaded; then a new one (the cache key moved with the contents).
+    fx.paused.store(true, Ordering::SeqCst);
+    std::fs::write(&a, pattern(1000, 9)).unwrap();
+    assert_eq!(thumbs::thumbnail(&a, 256), Err(ThumbStatus::NoThumbnail));
+    fx.paused.store(false, Ordering::SeqCst);
+    fx.e().mark_dirty(&a, Duration::ZERO);
+    assert!(wait_until(20, || cf::placeholder_info(&a).ok().flatten().is_some_and(|p| p.in_sync)));
+    let mut want2 = b"thumb:256:".to_vec();
+    want2.extend_from_slice(&pattern(1000, 9)[..8]);
+    assert_eq!(thumbs::thumbnail(&a, 256).unwrap(), want2);
+    assert_eq!(fx.server.requests("GET", "/thumbnail"), 2);
+}
